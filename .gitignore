@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Claude 本地配置
+.claude/
+
+# 冗余压缩包（已解压到 geo_instances/）
+geo_instances.zip
+
+# 编译产物（可执行文件，无扩展名）
+geo
+geo_new
+geo_test
+
+# 依赖软链接
+node_modules
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 实验产物（结果单独归档，不进版本控制）
+outputs/
+cmp_d300/
+cmp_modechange/
+test_modefix_20260607/
+*.log
+*.out
