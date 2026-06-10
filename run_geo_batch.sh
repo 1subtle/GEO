@@ -71,8 +71,19 @@ printf 'instance,seed,best_profit,best_time,elapsed_time,tasks_served,num_tasks,
 
 while IFS=$'\t' read -r inst seed log; do
     instance="$(basename "$inst")"
-    best_profit="$(awk '/ILS done/ {for(i=1;i<=NF;i++) if($i ~ /^bestProfit=/){split($i,a,"="); print a[2]}}' "$log" | tail -1)"
-    best_time="$(awk '/ILS done/ {for(i=1;i<=NF;i++) if($i ~ /^bestTime=/){split($i,a,"="); print a[2]}}' "$log" | tail -1)"
+    best_profit="$(awk '
+        /^(ILS done|MSBTS-GEO done)/ {
+            for(i=1;i<=NF;i++) if($i ~ /^bestProfit=/){split($i,a,"="); bp=a[2]}
+        }
+        /Total profit[[:space:]]*:/ {tp=$4}
+        END { if(bp!="") print bp; else if(tp!="") print tp }
+    ' "$log")"
+    best_time="$(awk '
+        /^(ILS done|MSBTS-GEO done)/ {
+            for(i=1;i<=NF;i++) if($i ~ /^bestTime=/){split($i,a,"="); bt=a[2]}
+        }
+        END { if(bt!="") print bt }
+    ' "$log")"
     elapsed="$(awk '/Elapsed time:/ {print $3}' "$log" | tail -1)"
     served="$(awk '/Tasks served/ {print $4}' "$log" | tail -1)"
     total_tasks="$(awk '/Tasks served/ {print $6}' "$log" | tail -1)"
@@ -80,9 +91,10 @@ while IFS=$'\t' read -r inst seed log; do
     if grep -q "Solution verified OK" "$log"; then
         verified="YES"
     fi
+    log_path="$(cd "$(dirname "$log")" && pwd)/$(basename "$log")"
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$instance" "$seed" "$best_profit" "$best_time" "$elapsed" \
-        "$served" "$total_tasks" "$verified" "$log" >> "$CSV"
+        "$served" "$total_tasks" "$verified" "$log_path" >> "$CSV"
 done < "$JOBS_FILE"
 
 {
