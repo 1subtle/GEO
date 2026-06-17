@@ -54,8 +54,6 @@ int *moveFreq;       // moveFreq[j]  : how often task j has been moved (for pert
 int *tabuUntil;      // tabuUntil[j] : iteration index until which task j is tabu
 int  tabuIter;       // iteration counter within one tabu local search call
 
-// ---- mode-flip neighbourhood (kind=4) state ----
-int  *tabuBeamMode;  // tabuBeamMode[b]: iteration until which beam b's mode is tabu
 int **typeProfitSum; // typeProfitSum[b][t]: sum of profit of served tasks of type t on beam b
 
 // CSR buckets of served tasks grouped by beam, rebuilt each local_search
@@ -71,11 +69,6 @@ long long g_tabuBlock = 0;   // candidate (task) skips due to tabu (no aspiratio
 long long g_aspire    = 0;   // tabu moves admitted via aspiration
 double    g_lsTime    = 0.0; // cumulative CPU seconds spent inside local_search
 double    g_perturbTime = 0.0; // cumulative CPU seconds spent inside perturb
-
-// ---- mode-flip (kind=4) profiling ----
-long long g_flipCand   = 0;  // (beam,mode2) pairs evaluated for mode-flip
-long long g_flipApplied = 0; // kind=4 moves committed
-long long g_flipApplyToMode[16] = {0}; // committed flips counted by target mode index
 
 
 static char g_line[MAXLINE];
@@ -527,7 +520,6 @@ void alloc_search()
     bucketTask   = new int[numTask];
     bucketStart  = new int[numBeam + 1];
 
-    tabuBeamMode = new int[numBeam];
     typeProfitSum = new int*[numBeam];
     for (int b = 0; b < numBeam; b++)
     {
@@ -564,40 +556,16 @@ void record_candidate(int kind, int a, int b, int c, int delta,
 }
 
 //--------------------------------------------------------------------
-// apply_mode_flip: commit a pure mode switch of beam b to mode m2 — evict
-// only the served tasks whose type is incompatible with m2, switch the base
-// power, and stop.  No refill: the freed capacity is left for subsequent
-// insert/swap moves.  Matches the candidate block's delta = -eviction_loss.
-//--------------------------------------------------------------------
-void apply_mode_flip(int b, int m2, int tenure)
-{
-    int saveMode = beamMode[b];
-
-    for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
-    {
-        int j = bucketTask[idx];
-        if (taskBeam[j] == b && !typeCompatMode[taskType[j] - 1][m2])
-        {
-            remove_task(j);
-            moveFreq[j]++;
-            tabuUntil[j] = tabuIter + tenure;
-        }
-    }
-
-    beamMode[b] = m2;
-    remPW[b] += modeBasePower[saveMode] - modeBasePower[m2];
-    // (remPW >= 0 guaranteed by the power check that admitted this move)
-}
-
-//--------------------------------------------------------------------
 void local_search(double beginTime, int *tmpIdx, double *tmpVal)
 {
-    int ts_depth = 300;              // non-improving iterations before a phase ends (triggers perturb)
+    (void)tmpIdx;
+    (void)tmpVal;
+
+    int ts_depth = 50;               // non-improving iterations before a phase ends (triggers perturb)
     int nonImprove = 0;
     double lsStart = (double)clock();
 
     for (int j = 0; j < numTask; j++) tabuUntil[j] = 0;
-    for (int b = 0; b < numBeam; b++) tabuBeamMode[b] = 0;
     tabuIter = 0;
 
     while (nonImprove < ts_depth)
@@ -707,54 +675,6 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             }
         }
 
-        // (4) mode-flip: switch beam b's mode, evicting ONLY the served tasks
-        //     whose type is incompatible with the new mode.  No refill here:
-        //     the freed room is left for later insert/swap moves to fill, so
-        //     the move's delta is exactly the eviction loss (<= 0).  This keeps
-        //     a flip honest about its real local cost (it no longer looks like
-        //     a gain by greedily refilling) and lets insert/swap compete for
-        //     the freed capacity on equal footing.
-        for (int b = 0; b < numBeam; b++)
-        {
-            if (beamMode[b] < 0) continue;
-            if (tabuIter < tabuBeamMode[b]) continue;   // beam mode tabu: skip whole beam
-            int usedPW_b = (beamPWCap[b] - modeBasePower[beamMode[b]]) - remPW[b];
-            for (int m2 = 0; m2 < numMode; m2++)
-            {
-                if (m2 == beamMode[b]) continue;
-                if (modeBasePower[m2] > beamPWCap[b]) continue;  // mode power-infeasible
-
-                // eviction loss (profit) of types incompatible with m2
-                int loss = 0;
-                for (int t = 0; t < numType; t++)
-                    if (!typeCompatMode[t][m2]) loss += typeProfitSum[b][t];
-
-                // evicted power: kept tasks must still fit m2's power budget;
-                // if any task being evicted is itself tabu, skip this m2 so a
-                // mode flip cannot quietly move a recently-touched task.
-                int evictPW = 0;
-                int evictTabu = 0;
-                for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
-                {
-                    int j = bucketTask[idx];
-                    if (taskBeam[j] == b && !typeCompatMode[taskType[j] - 1][m2])
-                    {
-                        evictPW += taskPWDemand[j];
-                        if (tabuIter < tabuUntil[j]) { evictTabu = 1; break; }
-                    }
-                }
-                if (evictTabu) continue;                          // evicts a tabu task: skip
-                if (usedPW_b - evictPW > beamPWCap[b] - modeBasePower[m2]) continue;
-
-                int delta = -loss;                 // pure switch: exact, always <= 0
-                g_flipCand++;
-                if (delta < bestDelta) continue;
-
-                record_candidate(4, b, m2, -1, delta,
-                                 bestDelta, numBest, kind, a, bb, cc);
-            }
-        }
-
         // ---- no admissible candidate in this iteration: advance tabu time ----
         if (numBest == 0)
         {
@@ -799,14 +719,6 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             tabuUntil[a]  = tabuIter + tenure;
             tabuUntil[cc] = tabuIter + tenure;
         }
-        else if (kind == 4)                       // mode-flip beam a to mode bb
-        {
-            apply_mode_flip(a, bb, tenure);
-            tabuBeamMode[a] = tabuIter + tenure;
-            g_flipApplied++;
-            if (bb >= 0 && bb < 16) g_flipApplyToMode[bb]++;
-        }
-
         if (totalProfit > bestProfit)
         {
             save_best(beginTime);
@@ -1127,14 +1039,6 @@ void ils()
          << "  perturb_time=" << g_perturbTime << "s (" << (totalLS ? 100.0 * g_perturbTime / totalLS : 0) << "%)" << endl;
     cout << "[PROFILE] us_per_ls_iter=" << (g_lsIters ? 1e6 * g_lsTime / g_lsIters : 0) << endl;
 
-    // ---- mode-flip (kind=4) report ----
-    cout << "[PROFILE] flip_cand=" << g_flipCand
-         << "  applied=" << g_flipApplied
-         << " (" << (g_lsMoves ? 100.0 * g_flipApplied / g_lsMoves : 0) << "% of moves)" << endl;
-    cout << "[PROFILE] flip_applied_by_mode:";
-    for (int m = 0; m < numMode && m < 16; m++)
-        cout << " " << modeName[m] << "=" << g_flipApplyToMode[m];
-    cout << endl;
 }
 
 //--------------------------------------------------------------------
@@ -1263,7 +1167,6 @@ void free_memory()
     delete[] bucketTask;
     delete[] bucketStart;
 
-    delete[] tabuBeamMode;
     for (int b = 0; b < numBeam; b++) delete[] typeProfitSum[b];
     delete[] typeProfitSum;
 }
