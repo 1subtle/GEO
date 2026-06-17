@@ -71,14 +71,11 @@ long long g_tabuBlock = 0;   // candidate (task) skips due to tabu (no aspiratio
 long long g_aspire    = 0;   // tabu moves admitted via aspiration
 double    g_lsTime    = 0.0; // cumulative CPU seconds spent inside local_search
 double    g_perturbTime = 0.0; // cumulative CPU seconds spent inside perturb
-long long g_moveApplied[6] = {0}; // applied moves by kind: 1..5
 
 // ---- mode-flip (kind=4) profiling ----
 long long g_flipCand   = 0;  // (beam,mode2) pairs evaluated for mode-flip
 long long g_flipApplied = 0; // kind=4 moves committed
 long long g_flipApplyToMode[16] = {0}; // committed flips counted by target mode index
-long long g_ejectCand   = 0; // kind=5 eject-insert candidates
-long long g_ejectApplied = 0; // kind=5 moves committed
 
 
 static char g_line[MAXLINE];
@@ -420,20 +417,6 @@ int feasible_on(int j, int b)
 }
 
 //--------------------------------------------------------------------
-// find_reloc_target: first beam, other than excludeBeam, that can receive
-// task r under the current remaining resources.
-//--------------------------------------------------------------------
-int find_reloc_target(int r, int excludeBeam)
-{
-    for (int b = 0; b < numBeam; b++)
-    {
-        if (b == excludeBeam) continue;
-        if (feasible_on(r, b)) return b;
-    }
-    return -1;
-}
-
-//--------------------------------------------------------------------
 // add_task / remove_task: assign or unassign a task, keeping remBW /
 // remPW / taskBeam / totalProfit consistent.  (No mode change here.)
 //--------------------------------------------------------------------
@@ -612,8 +595,6 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
     int ts_depth = 300;              // non-improving iterations before a phase ends (triggers perturb)
     int nonImprove = 0;
     double lsStart = (double)clock();
-    (void)tmpIdx;
-    (void)tmpVal;
 
     for (int j = 0; j < numTask; j++) tabuUntil[j] = 0;
     for (int b = 0; b < numBeam; b++) tabuBeamMode[b] = 0;
@@ -704,54 +685,6 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
 
                     record_candidate(3, i, b, k, delta,
                                      bestDelta, numBest, kind, a, bb, cc);
-                }
-            }
-        }
-
-        // (5) eject-insert: serve a stuck unserved task u on beam b by
-        //     moving one resident task r from b to another feasible beam b'.
-        //     The only profit change is adding u, so delta = profit[u].
-        for (int u = 0; u < numTask; u++)
-        {
-            if (taskBeam[u] != -1) continue;
-            if (tabuIter < tabuUntil[u]) { g_tabuBlock++; continue; }
-
-            int delta = taskProfit[u];
-            if (delta < bestDelta) continue;
-
-            int tu = taskType[u] - 1;
-            int directInsert = 0;
-            for (int b = 0; b < numBeam; b++)
-            {
-                if (feasible_on(u, b)) { directInsert = 1; break; }
-            }
-            if (directInsert) continue;
-
-            int found = 0;
-            for (int b = 0; b < numBeam && !found; b++)
-            {
-                if (beamMode[b] < 0) continue;
-                if (!typeCompatMode[tu][beamMode[b]]) continue;
-
-                int needBW = taskBWDemand[u] - remBW[b];
-                int needPW = taskPWDemand[u] - remPW[b];
-                if (needBW <= 0 && needPW <= 0) continue;
-                if (needBW < 0) needBW = 0;
-                if (needPW < 0) needPW = 0;
-
-                for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
-                {
-                    int r = bucketTask[idx];
-                    if (tabuIter < tabuUntil[r]) continue;
-                    if (taskBWDemand[r] < needBW) continue;
-                    if (taskPWDemand[r] < needPW) continue;
-                    if (find_reloc_target(r, b) < 0) continue;
-
-                    g_ejectCand++;
-                    record_candidate(5, u, b, r, delta,
-                                     bestDelta, numBest, kind, a, bb, cc);
-                    found = 1;
-                    break;
                 }
             }
         }
@@ -847,23 +780,6 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             g_flipApplied++;
             if (bb >= 0 && bb < 16) g_flipApplyToMode[bb]++;
         }
-        else if (kind == 5)                       // eject-insert: a into bb, cc relocates out
-        {
-            int b2 = find_reloc_target(cc, bb);
-            if (b2 < 0)
-            {
-                cout << "ERROR: eject-insert lost relocation target" << endl;
-                exit(1);
-            }
-            remove_task(cc);
-            add_task(a, bb);
-            add_task(cc, b2);
-            moveFreq[a]++; moveFreq[cc]++;
-            tabuUntil[a]  = tabuIter + tenure;
-            tabuUntil[cc] = tabuIter + tenure;
-            g_ejectApplied++;
-        }
-        if (kind >= 1 && kind <= 5) g_moveApplied[kind]++;
 
         if (totalProfit > bestProfit)
         {
@@ -916,9 +832,9 @@ void perturb(int *tmpIdx, double *tmpVal)
 
     // per-beam frequency key = sum of moveFreq over its served tasks
     int    *perturbBeam = new int[numBeam];      // scratch: beams chosen to empty
-    int    *prevMode = new int[numBeam];         // mode each emptied beam had before destroy
+    int    *prevMode    = new int[numBeam];      // mode each emptied beam had before destroy
     double *beamFreqKey = new double[numBeam];
-    int    *order = new int[numBeam];
+    int    *order       = new int[numBeam];
     for (int b = 0; b < numBeam; b++) { beamFreqKey[b] = 0.0; order[b] = b; }
     for (int j = 0; j < numTask; j++)
         if (taskBeam[j] >= 0) beamFreqKey[taskBeam[j]] += moveFreq[j];
@@ -968,7 +884,6 @@ void perturb(int *tmpIdx, double *tmpVal)
 
         for (int m = 0; m < numMode; m++)
         {
-            if (numMode > 1 && m == prevMode[k]) continue;       // force a real mode perturbation
             if (modeBasePower[m] > beamPWCap[b]) continue;       // power infeasible
 
             beamMode[b] = m;
@@ -977,10 +892,10 @@ void perturb(int *tmpIdx, double *tmpVal)
 
             int nFree = 0;
             for (int j = 0; j < numTask; j++)
-                if (taskBeam[j] == -1 && typeCompatMode[taskType[j] - 1][m])
+                if (taskBeam[j] == -1)
                 {
                     tmpIdx[nFree] = j;
-                    tmpVal[nFree] = task_score(j, b, m);
+                    tmpVal[nFree] = task_priority(j);
                     nFree++;
                 }
             if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
@@ -1182,18 +1097,6 @@ void ils()
          << "  stall_rate=" << (g_lsIters ? 100.0 * g_lsStall / g_lsIters : 0) << "%" << endl;
     cout << "[PROFILE] tabu_blocks=" << g_tabuBlock
          << "  aspirations=" << g_aspire << endl;
-    cout << "[PROFILE] move_kinds:"
-         << " insert=" << g_moveApplied[1]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[1] / g_lsMoves : 0) << "%)"
-         << " remove=" << g_moveApplied[2]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[2] / g_lsMoves : 0) << "%)"
-         << " same_swap=" << g_moveApplied[3]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[3] / g_lsMoves : 0) << "%)"
-         << " mode_flip=" << g_moveApplied[4]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[4] / g_lsMoves : 0) << "%)"
-         << " eject_insert=" << g_moveApplied[5]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[5] / g_lsMoves : 0) << "%)"
-         << endl;
     cout << "[PROFILE] ls_time=" << g_lsTime << "s (" << (totalLS ? 100.0 * g_lsTime / totalLS : 0) << "%)"
          << "  perturb_time=" << g_perturbTime << "s (" << (totalLS ? 100.0 * g_perturbTime / totalLS : 0) << "%)" << endl;
     cout << "[PROFILE] us_per_ls_iter=" << (g_lsIters ? 1e6 * g_lsTime / g_lsIters : 0) << endl;
@@ -1206,10 +1109,6 @@ void ils()
     for (int m = 0; m < numMode && m < 16; m++)
         cout << " " << modeName[m] << "=" << g_flipApplyToMode[m];
     cout << endl;
-    cout << "[PROFILE] eject_cand=" << g_ejectCand
-         << "  applied=" << g_ejectApplied
-         << " (" << (g_lsMoves ? 100.0 * g_ejectApplied / g_lsMoves : 0)
-         << "% of moves)" << endl;
 }
 
 //--------------------------------------------------------------------
