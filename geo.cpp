@@ -631,8 +631,15 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         for (int j = 0; j < numTask; j++)
         {
             if (taskBeam[j] != -1) continue;
-            if (tabuIter < tabuUntil[j]) { g_tabuBlock++; continue; }   // tabu: skip, no aspiration
             int delta = taskProfit[j];
+            // aspiration (best-ever): a tabu insert is admitted only if it would
+            // push the current solution past the phase-best profit.
+            int jTabu = (tabuIter < tabuUntil[j]);
+            if (jTabu)
+            {
+                if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
+                else { g_tabuBlock++; continue; }
+            }
             for (int b = 0; b < numBeam; b++)
             {
                 if (!feasible_on(j, b)) continue;
@@ -646,8 +653,12 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         for (int j = 0; j < numTask; j++)
         {
             if (taskBeam[j] < 0) continue;
-            if (tabuIter < tabuUntil[j]) { g_tabuBlock++; continue; }   // tabu: skip, no aspiration
             int delta = -taskProfit[j];
+            if (tabuIter < tabuUntil[j])
+            {
+                if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
+                else { g_tabuBlock++; continue; }
+            }
             if (delta < bestDelta) continue;
 
             record_candidate(2, j, -1, -1, delta,
@@ -661,7 +672,7 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         for (int i = 0; i < numTask; i++)
         {
             if (taskBeam[i] != -1) continue;
-            if (tabuIter < tabuUntil[i]) { g_tabuBlock++; continue; }   // tabu i: skip its whole beam x k scan
+            int iTabu = (tabuIter < tabuUntil[i]);
             int ti = taskType[i] - 1;
             for (int b = 0; b < numBeam; b++)
             {
@@ -673,10 +684,17 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
                 for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
                 {
                     int k = bucketTask[idx];
-                    if (tabuIter < tabuUntil[k]) continue;   // tabu k: skip this pair
 
                     int delta = taskProfit[i] - taskProfit[k];
                     if (delta < bestDelta) continue;
+
+                    // aspiration (best-ever): a swap whose i or k is tabu is
+                    // admitted only if it would beat the phase-best profit.
+                    if (iTabu || tabuIter < tabuUntil[k])
+                    {
+                        if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
+                        else continue;
+                    }
 
                     // feasibility after removing k, adding i (same beam b)
                     int bwFree = bwFree0 + taskBWDemand[k];
@@ -746,6 +764,14 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             continue;
         }
         g_lsMoves++;
+
+        // count an aspiration whenever the committed move broke a task tabu
+        // (its profit-improving endpoint was frozen): kind 1/3 add task a,
+        // kind 2/3 touch the removed/served endpoint a/cc.
+        if ((kind == 1 && tabuIter < tabuUntil[a]) ||
+            (kind == 2 && tabuIter < tabuUntil[a]) ||
+            (kind == 3 && (tabuIter < tabuUntil[a] || tabuIter < tabuUntil[cc])))
+            g_aspire++;
 
         // one tenure per move: every task/beam this move touches is frozen for
         // the SAME number of iterations, so a move can never be partially undone
