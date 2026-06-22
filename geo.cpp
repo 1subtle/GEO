@@ -695,23 +695,7 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             }
         }
 
-        // (2) remove-only: drop a served task ------------------------
-        for (int j = 0; j < numTask; j++)
-        {
-            if (taskBeam[j] < 0) continue;
-            int delta = -taskProfit[j];
-            if (tabuIter < tabuUntil[j])
-            {
-                if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
-                else { g_tabuBlock++; continue; }
-            }
-            if (delta < bestDelta) continue;
-
-            record_candidate(2, j, -1, -1, delta,
-                             bestDelta, numBest, kind, a, bb, cc);
-        }
-
-        // (3) swap: unserved i replaces served k on the same beam -------
+        // (2) swap: unserved i replaces served k on the same beam -------
         //     For each unserved i, only visit beams whose mode is compatible
         //     with i, and within such a beam only its served tasks (bucket),
         //     instead of rescanning every task.  Same (i,k) pairs as before.
@@ -899,7 +883,6 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         g_lsMoves++;
         // count an aspiration whenever the committed move broke a task/beam tabu
         if ((kind == 1 && tabuIter < tabuUntil[a]) ||
-            (kind == 2 && tabuIter < tabuUntil[a]) ||
             (kind == 3 && (tabuIter < tabuUntil[a] || tabuIter < tabuUntil[cc])) ||
             (kind == 4 && tabuIter < tabuBeamMode[a]) ||
             (kind == 5 && (tabuIter < tabuUntil[a] ||
@@ -912,13 +895,6 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             moveFreq[a]++;
             tabuUntil[a] = tabuIter + tabu_tenure();
             g_applyInsert++;
-        }
-        else if (kind == 2)                       // remove-only
-        {
-            remove_task(a);
-            moveFreq[a]++;
-            tabuUntil[a] = tabuIter + tabu_tenure();
-            g_applyRemove++;
         }
         else if (kind == 3)                       // swap a in, cc out
         {
