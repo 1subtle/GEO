@@ -4,91 +4,104 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <math.h>
 
-#define MAXLINE    65536   // max bytes per line in instance file
-#define MAXTYPE    20      // max number of task types
-#define MAXNAMELEN 32      // max length of mode name
-#define MININT_MOVE (-2000000000)   // "minus infinity" delta seed for tabu search
+#define MAXLINE     65536       // 算例文件每行最大字节数
+#define MAXTYPE     20          // 任务类型数量上限
+#define MAXNAMELEN  32          // 模式名称最大长度
+#define MININT_MOVE (-2000000000)   // 禁忌搜索中 delta 的“负无穷”初值
 
 using namespace std;
 
+//====================================================================
+// 问题数据（由 read_instance 填充）
+//====================================================================
 char *instanceName;
 
-int numBeam;          // B: number of beams
-int numTask;          // N: number of tasks
-int numMode;          // M: number of service modes
-int numType;          // T: number of task types
+int numBeam;          // B：波束数量
+int numTask;          // N：任务数量
+int numMode;          // M：服务模式数量
+int numType;          // T：任务类型数量
 
-char **modeName;      // modeName[m]             : name string of mode m
-int  *modeBasePower;  // modeBasePower[m]         : fixed power consumed by mode m
-int **typeCompatMode; // typeCompatMode[t][m] = 1 if task-type (t+1) can use mode m
+char **modeName;      // modeName[m]          ：模式 m 的名称
+int  *modeBasePower;  // modeBasePower[m]      ：模式 m 的固定基础功耗
+int **typeCompatMode; // typeCompatMode[t][m]=1 表示任务类型 (t+1) 可使用模式 m
 
-int *beamBWCap;       // beamBWCap[b]   : bandwidth capacity of beam b
-int *beamPWCap;       // beamPWCap[b]   : power capacity of beam b
+int *beamBWCap;       // beamBWCap[b]   ：波束 b 的带宽容量
+int *beamPWCap;       // beamPWCap[b]   ：波束 b 的功率容量
 
-int *taskType;        // taskType[j]    : type of task j (1-indexed)
-int *taskProfit;      // taskProfit[j]  : profit of task j
-int *taskBWDemand;    // taskBWDemand[j]: bandwidth demand of task j
-int *taskPWDemand;    // taskPWDemand[j]: power demand of task j
+int *taskType;        // taskType[j]    ：任务 j 的类型（从 1 起编）
+int *taskProfit;      // taskProfit[j]  ：任务 j 的收益
+int *taskBWDemand;    // taskBWDemand[j]：任务 j 的带宽需求
+int *taskPWDemand;    // taskPWDemand[j]：任务 j 的功率需求
 
-int *beamMode;   // beamMode[b]   : mode index chosen for beam b
-int *taskBeam;   // taskBeam[j]   : beam serving task j  (-1 = not served)
-int *remBW;      // remBW[b]      : remaining bandwidth of beam b
-int *remPW;      // remPW[b]      : remaining power of beam b (after base power)
+//====================================================================
+// 当前解状态
+//====================================================================
+int *beamMode;        // beamMode[b]  ：波束 b 所选的模式编号
+int *taskBeam;        // taskBeam[j]  ：服务任务 j 的波束（-1 表示未服务）
+int *remBW;           // remBW[b]     ：波束 b 的剩余带宽
+int *remPW;           // remPW[b]     ：波束 b 的剩余功率（扣除基础功耗后）
 int  totalProfit;
 
-double maxRunTime;   // time limit in seconds
-double bestTime;     // time (s) at which the phase-best solution was found
-int    seed;         // random seed
+double maxRunTime;    // 运行时间上限（秒）
+double bestTime;      // 找到本阶段最优解的时刻（秒）
+int    seed;          // 随机种子
 
-int *bestBeamMode;   // snapshot of the best solution found in the current ILS phase
+//====================================================================
+// 最优解快照
+//====================================================================
+int *bestBeamMode;    // 当前 ILS 阶段内找到的最优解
 int *bestTaskBeam;
 int  bestProfit;
 
-int *globalBeamMode; // snapshot of the best solution found across all ILS phases
+int *globalBeamMode;  // 所有 ILS 阶段中找到的全局最优解
 int *globalTaskBeam;
 int  globalProfit;
 double globalBestTime;
 
-int *moveFreq;       // moveFreq[j]  : how often task j has been moved (for perturbation)
-int *tabuUntil;      // tabuUntil[j] : iteration index until which task j is tabu
-int  tabuIter;       // iteration counter within one tabu local search call
+//====================================================================
+// 禁忌搜索 / 搜索辅助量
+//====================================================================
+int *moveFreq;        // moveFreq[j]   ：任务 j 被移动的次数（用于扰动）
+int **typeProfitSum;  // typeProfitSum[b][t]：波束 b 上已服务类型 t 任务的收益之和
 
-int  *tabuBeamMode;  // tabuBeamMode[b]: iteration until which beam b's mode is tabu
-int **typeProfitSum; // typeProfitSum[b][t]: sum of profit of served tasks of type t on beam b
+//====================================================================
+// 基于解的禁忌（参考 SBTS）：用 3 路加权哈希把整解映射到哈希表去重
+//====================================================================
+// 决策被选中时贡献权重、未选贡献 0（仿 SBTS）。任务-波束与波束-模式
+// 两部分变量都参与哈希。每路权重为扁平数组，与现有代码风格一致。
+// 持久哈希（学 MNSB-TS：全程只初始化一次，不清空），记忆贯穿整轮搜索。
+// 用 char(0/1) 省内存：3*1e8 字节 ≈ 300MB/进程（与 SBTS 原版 L=1e8 对齐）。
+#define HASH_L 100000000      // 哈希表槽位数（每路）
+long long *taskHashW1, *taskHashW2, *taskHashW3;   // [numTask*numBeam]，下标 j*numBeam+b
+long long *beamHashW1, *beamHashW2, *beamHashW3;   // [numBeam*numMode]，下标 b*numMode+m
+char *hashTab1, *hashTab2, *hashTab3;        // [HASH_L]：访问过的解(全程保留，0/1)
+long long Hx1, Hx2, Hx3;                     // 当前解的三路哈希和
 
-// CSR buckets of served tasks grouped by beam, rebuilt each local_search
-// iteration so the swap neighbourhood can skip unrelated tasks.
-int *bucketTask;     // [numTask]   : served task ids, contiguous per beam
-int *bucketStart;    // [numBeam+1] : bucketStart[b]..bucketStart[b+1] = beam b's slice
-int **insertMinPW;   // insertMinPW[m][bw]: min PW of an unserved task compatible with mode m
-int  maxBeamBWCap;
+int divStrength;      // 动态多样化强度：本次扰动要破坏的波束数（学 MNSB-TS：逃出回弱、停滞渐强）
 
-// ---- profiling counters (accumulated over the whole run) ----
-long long g_lsIters   = 0;   // total local_search inner iterations
-long long g_lsMoves   = 0;   // iterations that actually applied a move
-long long g_lsStall   = 0;   // iterations with no admissible candidate
-long long g_tabuBlock = 0;   // candidate (task) skips due to tabu (no aspiration)
-long long g_aspire    = 0;   // tabu moves admitted via aspiration
-double    g_lsTime    = 0.0; // cumulative CPU seconds spent inside local_search
-double    g_perturbTime = 0.0; // cumulative CPU seconds spent inside perturb
-long long g_applyInsert = 0; // committed insert moves
-long long g_applyRemove = 0; // committed remove-only moves
-long long g_applySwap   = 0; // committed swap moves
-long long g_applyFlip   = 0; // committed mode-flip moves
-long long g_applyCross  = 0; // committed cross-beam exchange moves
-long long g_crossCand   = 0; // feasible cross-beam exchange candidates
-long long g_crossRelocCand = 0; // kind=5 real-dummy candidates
-long long g_crossSwapCand  = 0; // kind=5 real-real candidates
-long long g_crossFiltered  = 0; // feasible kind=5 moves rejected by open-slot filter
-long long g_crossRelocApplied = 0; // committed real-dummy moves
-long long g_crossSwapApplied  = 0; // committed real-real moves
-long long g_flipCand    = 0; // feasible mode-flip candidates evaluated
-long long g_flipApplied = 0; // committed mode-flip moves
-long long g_flipApplyToMode[16] = {0}; // committed flips counted by target mode index
+//====================================================================
+// 每步局部搜索重建的加速索引
+//====================================================================
+// 按波束分组的已服务任务 CSR 桶，供交换邻域跳过无关任务。
+int *bucketTask;      // [numTask]   ：已服务任务编号，按波束连续存放
+int *bucketStart;     // [numBeam+1] ：bucketStart[b]..bucketStart[b+1] 为波束 b 的区间
+// 按（源波束，候选模式）分组的已服务任务。
+int *compatBucketTask;
+int *compatBucketStart;   // [numBeam*numMode+1]
+// 当前模式下可接受某任务类型的波束列表。
+int **typeCompatBeam;     // typeCompatBeam[t][p]：与类型 t 兼容的波束编号
+int  *typeCompatBeamCount;
+// insertMinPW[m][bw]：未服务、与模式 m 兼容且带宽需求<=bw 的任务的最小功率需求。
+int **insertMinPW;
+int   maxBeamBWCap;
 
 static char g_line[MAXLINE];
 
+//====================================================================
+// 读入算例
+//====================================================================
 int find_mode_index(const char *name)
 {
     for (int m = 0; m < numMode; m++)
@@ -97,6 +110,7 @@ int find_mode_index(const char *name)
     return -1;
 }
 
+// 对 val[] 做降序快速排序，同时携带 idx[]（贪心排序键）。
 void qsort_desc(double *val, int *idx, int l, int r)
 {
     if (l < r)
@@ -128,23 +142,23 @@ void read_instance()
         exit(0);
     }
 
-    // ---- Header line: B=5 N=50 M=3 Cbw=1578 Cpw=503 ----
+    // ---- 首行：B=5 N=50 M=3 Cbw=1578 Cpw=503 ----
     FIC.getline(g_line, MAXLINE);
     int cbw_total, cpw_total;
     sscanf(g_line, "B=%d N=%d M=%d Cbw=%d Cpw=%d",
            &numBeam, &numTask, &numMode, &cbw_total, &cpw_total);
 
-    modeName     = new char *[numMode];
+    modeName = new char *[numMode];
     for (int m = 0; m < numMode; m++)
         modeName[m] = new char[MAXNAMELEN];
     modeBasePower = new int[numMode];
 
-    // blank / "Modes" / "mode base_power"
+    // 空行 / "Modes" / "mode base_power"
     FIC.getline(g_line, MAXLINE);
     FIC.getline(g_line, MAXLINE);
     FIC.getline(g_line, MAXLINE);
 
-    // ---- M mode lines: "G 10" ----
+    // ---- M 行模式："G 10" ----
     for (int m = 0; m < numMode; m++)
     {
         FIC.getline(g_line, MAXLINE);
@@ -153,22 +167,21 @@ void read_instance()
         strcpy(modeName[m], tmp);
     }
 
-    // blank / "Task types" / "type name modes"
+    // 空行 / "Task types" / "type name modes"
     FIC.getline(g_line, MAXLINE);
     FIC.getline(g_line, MAXLINE);
     FIC.getline(g_line, MAXLINE);
 
-    // ---- Task type lines until blank line ----
+    // ---- 任务类型行，直到空行 ----
     static char typeLines[MAXTYPE][256];
     numType = 0;
     while (FIC.getline(g_line, MAXLINE))
     {
-        if ((int)strlen(g_line) == 0) break;   // blank line ends this section
+        if ((int)strlen(g_line) == 0) break;   // 空行结束本段
         strncpy(typeLines[numType], g_line, 255);
         typeLines[numType][255] = '\0';
         numType++;
     }
-    // blank line was already consumed by the breaking getline above
 
     typeCompatMode = new int *[numType];
     for (int t = 0; t < numType; t++)
@@ -192,14 +205,14 @@ void read_instance()
     beamBWCap = new int[numBeam];
     beamPWCap = new int[numBeam];
 
-    // Beam bandwidth capacity
-    FIC.getline(g_line, MAXLINE);                         // header
+    // 波束带宽容量
+    FIC.getline(g_line, MAXLINE);                         // 表头
     for (int b = 0; b < numBeam; b++) FIC >> beamBWCap[b];
-    FIC.getline(g_line, MAXLINE);                         // end of data line
-    FIC.getline(g_line, MAXLINE);                         // blank line
+    FIC.getline(g_line, MAXLINE);                         // 数据行结束
+    FIC.getline(g_line, MAXLINE);                         // 空行
 
-    // Beam power capacity
-    FIC.getline(g_line, MAXLINE);                         // header
+    // 波束功率容量
+    FIC.getline(g_line, MAXLINE);                         // 表头
     for (int b = 0; b < numBeam; b++) FIC >> beamPWCap[b];
     FIC.getline(g_line, MAXLINE);
     FIC.getline(g_line, MAXLINE);
@@ -209,55 +222,37 @@ void read_instance()
     taskBWDemand = new int[numTask];
     taskPWDemand = new int[numTask];
 
-    // Task types
-    FIC.getline(g_line, MAXLINE);                         // header
+    // 任务类型
+    FIC.getline(g_line, MAXLINE);                         // 表头
     for (int j = 0; j < numTask; j++) FIC >> taskType[j];
     FIC.getline(g_line, MAXLINE);
     FIC.getline(g_line, MAXLINE);
 
-    // Task profits
-    FIC.getline(g_line, MAXLINE);                         // header
+    // 任务收益
+    FIC.getline(g_line, MAXLINE);                         // 表头
     for (int j = 0; j < numTask; j++) FIC >> taskProfit[j];
     FIC.getline(g_line, MAXLINE);
     FIC.getline(g_line, MAXLINE);
 
-    // Task bandwidth demands
-    FIC.getline(g_line, MAXLINE);                         // header
+    // 任务带宽需求
+    FIC.getline(g_line, MAXLINE);                         // 表头
     for (int j = 0; j < numTask; j++) FIC >> taskBWDemand[j];
     FIC.getline(g_line, MAXLINE);
     FIC.getline(g_line, MAXLINE);
 
-    // Task power demands (last section, no trailing blank needed)
-    FIC.getline(g_line, MAXLINE);                         // header
+    // 任务功率需求（最后一段）
+    FIC.getline(g_line, MAXLINE);                         // 表头
     for (int j = 0; j < numTask; j++) FIC >> taskPWDemand[j];
 
     FIC.close();
-
-    // ---- Print instance summary ----
-    cout << "Instance: " << instanceName << endl;
-    cout << "B=" << numBeam << "  N=" << numTask
-         << "  M=" << numMode << "  T=" << numType << endl;
-    for (int m = 0; m < numMode; m++)
-        cout << "  Mode[" << m << "] " << modeName[m]
-             << "  base_pw=" << modeBasePower[m] << endl;
-    cout << "Task type compatibility:" << endl;
-    for (int t = 0; t < numType; t++)
-    {
-        cout << "  Type " << (t + 1) << ":";
-        for (int m = 0; m < numMode; m++)
-            if (typeCompatMode[t][m])
-                cout << " " << modeName[m];
-        cout << endl;
-    }
 }
 
-//--------------------------------------------------------------------
-// task_score: profit per unit of normalized resource usage on beam b
-// under mode m.  Bandwidth and power are each normalized by the beam's
-// capacity (power capacity = beamPWCap minus the mode base power), so a
-// task that eats a large fraction of either resource scores lower.
-// Used only as a greedy ordering / priority key, never as the objective.
-//--------------------------------------------------------------------
+//====================================================================
+// 贪心排序键
+//====================================================================
+// task_score：任务 j 在波束 b、模式 m 下，单位归一化资源占用的收益。
+// 带宽与功率分别按波束容量归一化，占用任一资源比例大的任务得分更低。
+// 仅作贪心排序/优先级键，不作为目标函数。
 double task_score(int j, int b, int m)
 {
     double pwCap = (double)(beamPWCap[b] - modeBasePower[m]);
@@ -272,26 +267,27 @@ double task_score(int j, int b, int m)
     return (double)taskProfit[j] / denom;
 }
 
-//--------------------------------------------------------------------
-// task_priority: the best score task j can attain on any mode-compatible
-// beam (using each beam's total task power capacity, not the dynamic
-// remaining power, so the key is static during one greedy pass).
-// Returns -1 if j has no compatible beam at all.
-//--------------------------------------------------------------------
+// task_priority：任务 j 在任意模式兼容波束上可达到的最佳 task_score。
+// 若 j 没有任何兼容波束，返回 -1。
 double task_priority(int j)
 {
     int    t    = taskType[j] - 1;
     double best = -1.0;
     for (int b = 0; b < numBeam; b++)
     {
-        if (beamMode[b] < 0)                  continue;
-        if (!typeCompatMode[t][beamMode[b]])  continue;
+        if (beamMode[b] < 0)                 continue;
+        if (!typeCompatMode[t][beamMode[b]]) continue;
         double s = task_score(j, b, beamMode[b]);
         if (s > best) best = s;
     }
     return best;
 }
 
+//====================================================================
+// 贪心初始解
+//====================================================================
+// 顺序提交贪心：对每个波束，从当前未服务池中试填以选模式，
+// 提交后再处理下一波束，使波束之间竞争任务。
 void greedy_init()
 {
     beamMode = new int[numBeam];
@@ -301,18 +297,13 @@ void greedy_init()
 
     for (int j = 0; j < numTask; j++) taskBeam[j] = -1;
 
-    int    *tmpIdx = new int   [numTask];
-    double *tmpVal = new double[numTask];
-    int    *trialAdded = new int[numTask];
-    int    *bestAdded  = new int[numTask];
+    int    *tmpIdx     = new int   [numTask];
+    double *tmpVal     = new double[numTask];
+    int    *trialAdded = new int   [numTask];
+    int    *bestAdded  = new int   [numTask];
 
     totalProfit = 0;
 
-    //================================================================
-    // Sequential-commit greedy (same idea as perturb's repair-modes):
-    // decide each beam's mode by trial-filling from the current unserved
-    // pool, then commit that fill before moving on so beams compete for tasks.
-    //================================================================
     for (int b = 0; b < numBeam; b++)
     {
         int bestM      = -1;
@@ -321,9 +312,9 @@ void greedy_init()
 
         for (int m = 0; m < numMode; m++)
         {
-            if (modeBasePower[m] > beamPWCap[b]) continue;   // power infeasible
+            if (modeBasePower[m] > beamPWCap[b]) continue;   // 功率不可行
 
-            // rank current unserved, mode-compatible tasks by density score
+            // 将当前未服务且与模式 m 兼容的任务按密度得分排序
             int nFree = 0;
             for (int j = 0; j < numTask; j++)
                 if (taskBeam[j] == -1 && typeCompatMode[taskType[j] - 1][m])
@@ -358,14 +349,14 @@ void greedy_init()
             }
         }
 
-        if (bestM < 0)   // no power-feasible mode: take the cheapest base-power
+        if (bestM < 0)   // 无功率可行模式：选基础功耗最低的模式
         {
             for (int m = 0; m < numMode; m++)
                 if (bestM < 0 || modeBasePower[m] < modeBasePower[bestM]) bestM = m;
             nBestAdded = 0;
         }
 
-        // commit chosen mode + its fill (inline: typeProfitSum not yet allocated)
+        // 提交所选模式及其填充（此处尚未分配 typeProfitSum）
         beamMode[b] = bestM;
         remBW[b]    = beamBWCap[b];
         remPW[b]    = beamPWCap[b] - modeBasePower[bestM];
@@ -383,36 +374,16 @@ void greedy_init()
     delete[] tmpVal;
     delete[] trialAdded;
     delete[] bestAdded;
-
-    cout << "Greedy init done.  totalProfit=" << totalProfit << endl;
 }
 
-//--------------------------------------------------------------------
-// Print beam-mode distribution + served-by-type for run diagnostics.
-//--------------------------------------------------------------------
-void probe_modes(const char *tag)
-{
-    int *mc = new int[numMode]; for (int m = 0; m < numMode; m++) mc[m] = 0;
-    for (int b = 0; b < numBeam; b++) if (beamMode[b] >= 0) mc[beamMode[b]]++;
-    int *st = new int[numType]; for (int t = 0; t < numType; t++) st[t] = 0;
-    int served = 0;
-    for (int j = 0; j < numTask; j++)
-        if (taskBeam[j] >= 0) { st[taskType[j]-1]++; served++; }
-    cout << "[PROBE " << tag << "] profit=" << totalProfit << " served=" << served << "  modes:";
-    for (int m = 0; m < numMode; m++) cout << " " << modeName[m] << "=" << mc[m];
-    cout << "  served_by_type:";
-    for (int t = 0; t < numType; t++) cout << " T" << (t+1) << "=" << st[t];
-    cout << endl;
-    delete[] mc; delete[] st;
-}
-
-//--------------------------------------------------------------------
-// feasible_on: can task j be assigned to beam b given the current
-// remaining resources?  (mode-compatible + BW + PW all sufficient)
-//--------------------------------------------------------------------
+//====================================================================
+// 底层解维护
+//====================================================================
+// feasible_on：在当前剩余资源下，任务 j 能否分配到波束 b？
+// （模式兼容 + 带宽足够 + 功率足够）
 int feasible_on(int j, int b)
 {
-    if (beamMode[b] < 0)                 return 0;   // mode not yet decided
+    if (beamMode[b] < 0)                 return 0;   // 模式尚未确定
     int t = taskType[j] - 1;
     if (!typeCompatMode[t][beamMode[b]]) return 0;
     if (taskBWDemand[j] > remBW[b])      return 0;
@@ -420,6 +391,8 @@ int feasible_on(int j, int b)
     return 1;
 }
 
+// 重建 insertMinPW[m][bw]：未服务、与模式 m 兼容且带宽需求不超过 bw 的任务的最小功率需求。
+// 用于快速判断某波束腾出空间后是否还能装入任意未服务任务。
 void rebuild_insert_filter()
 {
     const int INF = 1000000000;
@@ -440,6 +413,7 @@ void rebuild_insert_filter()
                 insertMinPW[m][bw] = taskPWDemand[j];
     }
 
+    // 对带宽做前缀最小，使 insertMinPW[m][w] 覆盖 BW<=w
     for (int m = 0; m < numMode; m++)
         for (int w = 1; w <= maxBeamBWCap; w++)
             if (insertMinPW[m][w - 1] < insertMinPW[m][w])
@@ -451,14 +425,11 @@ int beam_can_insert_unserved_with_rem(int b, int bwFree, int pwFree)
     if (beamMode[b] < 0) return 0;
     if (bwFree < 0 || pwFree < 0) return 0;
     if (bwFree > maxBeamBWCap) bwFree = maxBeamBWCap;
-
     return insertMinPW[beamMode[b]][bwFree] <= pwFree;
 }
 
-//--------------------------------------------------------------------
-// add_task / remove_task: assign or unassign a task, keeping remBW /
-// remPW / taskBeam / totalProfit consistent.  (No mode change here.)
-//--------------------------------------------------------------------
+// add_task / remove_task：分配或取消任务，保持 remBW / remPW /
+// taskBeam / totalProfit / typeProfitSum 一致。（此处不改变模式。）
 void add_task(int j, int b)
 {
     taskBeam[j]  = b;
@@ -478,26 +449,105 @@ void remove_task(int j)
     taskBeam[j]  = -1;
 }
 
-int tabu_tenure()
+//====================================================================
+// 基于解的禁忌：哈希权重生成与哈希表读写
+//====================================================================
+// init_hash：为 3 路哈希各生成一套权重（仿 SBTS：pow(k+1,e) 后随机洗牌）。
+// 任务-波束权重 numTask*numBeam 个，波束-模式权重 numBeam*numMode 个。
+void init_hash()
 {
-    return 5 + rand() % 6 + numBeam / 10;
+    int nT = numTask * numBeam;
+    int nB = numBeam * numMode;
+
+    for (int k = 0; k < nT; k++)
+    {
+        taskHashW1[k] = (long long)pow((double)(k + 1), 1.2);
+        taskHashW2[k] = (long long)pow((double)(k + 1), 1.6);
+        taskHashW3[k] = (long long)pow((double)(k + 1), 2.0);
+    }
+    for (int k = 0; k < nB; k++)
+    {
+        beamHashW1[k] = (long long)pow((double)(nT + k + 1), 1.2);
+        beamHashW2[k] = (long long)pow((double)(nT + k + 1), 1.6);
+        beamHashW3[k] = (long long)pow((double)(nT + k + 1), 2.0);
+    }
+
+    // 每路各自随机两两交换打乱（仿 SBTS initial_hash 的洗牌）
+    for (int k = 0; k < nT && nT > 1; k++)
+    {
+        int r;
+        r = rand() % nT; { long long t = taskHashW1[k]; taskHashW1[k] = taskHashW1[r]; taskHashW1[r] = t; }
+        r = rand() % nT; { long long t = taskHashW2[k]; taskHashW2[k] = taskHashW2[r]; taskHashW2[r] = t; }
+        r = rand() % nT; { long long t = taskHashW3[k]; taskHashW3[k] = taskHashW3[r]; taskHashW3[r] = t; }
+    }
+    for (int k = 0; k < nB && nB > 1; k++)
+    {
+        int r;
+        r = rand() % nB; { long long t = beamHashW1[k]; beamHashW1[k] = beamHashW1[r]; beamHashW1[r] = t; }
+        r = rand() % nB; { long long t = beamHashW2[k]; beamHashW2[k] = beamHashW2[r]; beamHashW2[r] = t; }
+        r = rand() % nB; { long long t = beamHashW3[k]; beamHashW3[k] = beamHashW3[r]; beamHashW3[r] = t; }
+    }
+
+    memset(hashTab1, 0, HASH_L);
+    memset(hashTab2, 0, HASH_L);
+    memset(hashTab3, 0, HASH_L);
 }
 
-//--------------------------------------------------------------------
-// save_best: snapshot current solution into the phase-best arrays.
-//--------------------------------------------------------------------
+// compute_hash：从当前解全量重算 Hx1/Hx2/Hx3（已服务任务 + 各波束模式）。
+void compute_hash()
+{
+    Hx1 = 0; Hx2 = 0; Hx3 = 0;
+    for (int j = 0; j < numTask; j++)
+    {
+        int b = taskBeam[j];
+        if (b < 0) continue;
+        int idx = j * numBeam + b;
+        Hx1 += taskHashW1[idx];
+        Hx2 += taskHashW2[idx];
+        Hx3 += taskHashW3[idx];
+    }
+    for (int b = 0; b < numBeam; b++)
+    {
+        if (beamMode[b] < 0) continue;
+        int idx = b * numMode + beamMode[b];
+        Hx1 += beamHashW1[idx];
+        Hx2 += beamHashW2[idx];
+        Hx3 += beamHashW3[idx];
+    }
+}
+
+// is_visited：给定候选解的三路哈希和，判断是否访问过（三表全中）。
+int is_visited(long long h1, long long h2, long long h3)
+{
+    int i1 = (int)(h1 % HASH_L); if (i1 < 0) i1 += HASH_L;
+    int i2 = (int)(h2 % HASH_L); if (i2 < 0) i2 += HASH_L;
+    int i3 = (int)(h3 % HASH_L); if (i3 < 0) i3 += HASH_L;
+    return hashTab1[i1] && hashTab2[i2] && hashTab3[i3];
+}
+
+// mark_current：把当前解（Hx1/Hx2/Hx3）三路槽位标记为已访问。
+void mark_current()
+{
+    int i1 = (int)(Hx1 % HASH_L); if (i1 < 0) i1 += HASH_L;
+    int i2 = (int)(Hx2 % HASH_L); if (i2 < 0) i2 += HASH_L;
+    int i3 = (int)(Hx3 % HASH_L); if (i3 < 0) i3 += HASH_L;
+    hashTab1[i1] = 1;
+    hashTab2[i2] = 1;
+    hashTab3[i3] = 1;
+}
+
+//====================================================================
+// 快照辅助（阶段最优与全局最优）
+//====================================================================
 void save_best(double beginTime)
 {
-    bestTime    = ((double)clock() - beginTime) / CLOCKS_PER_SEC;
-    bestProfit  = totalProfit;
+    bestTime   = ((double)clock() - beginTime) / CLOCKS_PER_SEC;
+    bestProfit = totalProfit;
     for (int b = 0; b < numBeam; b++) bestBeamMode[b] = beamMode[b];
     for (int j = 0; j < numTask; j++) bestTaskBeam[j] = taskBeam[j];
 }
 
-//--------------------------------------------------------------------
-// restore_best: copy the phase-best solution back into the current
-// solution and recompute remBW / remPW / totalProfit from scratch.
-//--------------------------------------------------------------------
+// restore_best：将阶段最优解写回当前解，并重算 remBW / remPW / totalProfit / typeProfitSum。
 void restore_best()
 {
     for (int b = 0; b < numBeam; b++)
@@ -554,17 +604,20 @@ void restore_global()
     }
 }
 
-
 void alloc_search()
 {
-    bestBeamMode = new int[numBeam];
-    bestTaskBeam = new int[numTask];
+    bestBeamMode   = new int[numBeam];
+    bestTaskBeam   = new int[numTask];
     globalBeamMode = new int[numBeam];
     globalTaskBeam = new int[numTask];
-    moveFreq     = new int[numTask];
-    tabuUntil    = new int[numTask];
-    bucketTask   = new int[numTask];
-    bucketStart  = new int[numBeam + 1];
+    moveFreq       = new int[numTask];
+    bucketTask     = new int[numTask];
+    bucketStart    = new int[numBeam + 1];
+    compatBucketTask  = new int[numTask * numMode];
+    compatBucketStart = new int[numBeam * numMode + 1];
+    typeCompatBeam      = new int*[numType];
+    typeCompatBeamCount = new int[numType];
+    for (int t = 0; t < numType; t++) typeCompatBeam[t] = new int[numBeam];
 
     maxBeamBWCap = 0;
     for (int b = 0; b < numBeam; b++)
@@ -573,15 +626,31 @@ void alloc_search()
     for (int m = 0; m < numMode; m++)
         insertMinPW[m] = new int[maxBeamBWCap + 1];
 
-    tabuBeamMode = new int[numBeam];
     typeProfitSum = new int*[numBeam];
     for (int b = 0; b < numBeam; b++)
     {
         typeProfitSum[b] = new int[numType];
         for (int t = 0; t < numType; t++) typeProfitSum[b][t] = 0;
     }
+
+    // 基于解禁忌：权重表与哈希表
+    taskHashW1 = new long long[numTask * numBeam];
+    taskHashW2 = new long long[numTask * numBeam];
+    taskHashW3 = new long long[numTask * numBeam];
+    beamHashW1 = new long long[numBeam * numMode];
+    beamHashW2 = new long long[numBeam * numMode];
+    beamHashW3 = new long long[numBeam * numMode];
+    hashTab1 = new char[HASH_L];
+    hashTab2 = new char[HASH_L];
+    hashTab3 = new char[HASH_L];
+    init_hash();
 }
 
+//====================================================================
+// 禁忌局部搜索
+//====================================================================
+// record_candidate：在并行（并集）邻域中，记录目前见到的最优 delta 候选移动。
+// 平局时用蓄水池抽样均匀随机打破。
 void record_candidate(int kind, int a, int b, int c, int delta,
                       int &bestDelta, int &numBest,
                       int &chosenKind, int &chosenA, int &chosenB, int &chosenC)
@@ -590,8 +659,8 @@ void record_candidate(int kind, int a, int b, int c, int delta,
 
     if (delta > bestDelta)
     {
-        bestDelta = delta;
-        numBest   = 1;
+        bestDelta  = delta;
+        numBest    = 1;
         chosenKind = kind;
         chosenA    = a;
         chosenB    = b;
@@ -609,11 +678,9 @@ void record_candidate(int kind, int a, int b, int c, int delta,
     }
 }
 
-//--------------------------------------------------------------------
-// apply_mode_flip: switch beam b to mode m2 and evict only tasks whose
-// types are incompatible with the new mode.  No refill is performed here.
-//--------------------------------------------------------------------
-void apply_mode_flip(int b, int m2, int tenure)
+// apply_mode_flip：将波束 b 切换到模式 m2，仅驱逐与新模式类型不兼容的任务。
+// 此处不做回填。
+void apply_mode_flip(int b, int m2)
 {
     int saveMode = beamMode[b];
 
@@ -624,7 +691,6 @@ void apply_mode_flip(int b, int m2, int tenure)
         {
             remove_task(j);
             moveFreq[j]++;
-            tabuUntil[j] = tabuIter + tenure;
         }
     }
 
@@ -632,82 +698,165 @@ void apply_mode_flip(int b, int m2, int tenure)
     remPW[b] += modeBasePower[saveMode] - modeBasePower[m2];
 }
 
-//--------------------------------------------------------------------
-void local_search(double beginTime, int *tmpIdx, double *tmpVal)
+// update_hash_for_move：在提交某 move 之前调用，用提交前状态把该 move 的增量
+// 加到 Hx1/Hx2/Hx3（SBTS 式增量哈希，省去全量重算）。增量公式与各邻域候选判禁忌
+// 时所用的完全一致（已经自检验证逐位相符）。kind/a/bb/cc 同提交段语义。
+void update_hash_for_move(int kind, int a, int bb, int cc)
 {
-    (void)tmpIdx;
-    (void)tmpVal;
+    if (kind == 1)                       // 插入 a→bb
+    {
+        int idx = a * numBeam + bb;
+        Hx1 += taskHashW1[idx]; Hx2 += taskHashW2[idx]; Hx3 += taskHashW3[idx];
+    }
+    else if (kind == 2)                  // 删除 a（在其当前波束）
+    {
+        int idx = a * numBeam + taskBeam[a];
+        Hx1 -= taskHashW1[idx]; Hx2 -= taskHashW2[idx]; Hx3 -= taskHashW3[idx];
+    }
+    else if (kind == 3)                  // 交换：a 入 bb、cc 出 bb
+    {
+        int idi = a * numBeam + bb, idk = cc * numBeam + bb;
+        Hx1 += taskHashW1[idi] - taskHashW1[idk];
+        Hx2 += taskHashW2[idi] - taskHashW2[idk];
+        Hx3 += taskHashW3[idi] - taskHashW3[idk];
+    }
+    else if (kind == 4)                  // 模式翻转：波束 a，m1->bb，驱逐不兼容任务
+    {
+        int bidx = a * numMode + bb, bidx0 = a * numMode + beamMode[a];
+        Hx1 += beamHashW1[bidx] - beamHashW1[bidx0];
+        Hx2 += beamHashW2[bidx] - beamHashW2[bidx0];
+        Hx3 += beamHashW3[bidx] - beamHashW3[bidx0];
+        for (int idx = bucketStart[a]; idx < bucketStart[a + 1]; idx++)
+        {
+            int j = bucketTask[idx];
+            if (taskBeam[j] == a && !typeCompatMode[taskType[j] - 1][bb])
+            {
+                int idj = j * numBeam + a;
+                Hx1 -= taskHashW1[idj]; Hx2 -= taskHashW2[idj]; Hx3 -= taskHashW3[idj];
+            }
+        }
+    }
+    else if (kind == 5)
+    {
+        int b1 = taskBeam[a];
+        if (cc < 0)                      // real-dummy：a 从 b1 迁到 bb
+        {
+            int idi2 = a * numBeam + bb, idi1 = a * numBeam + b1;
+            Hx1 += taskHashW1[idi2] - taskHashW1[idi1];
+            Hx2 += taskHashW2[idi2] - taskHashW2[idi1];
+            Hx3 += taskHashW3[idi2] - taskHashW3[idi1];
+        }
+        else                             // real-real：a:b1->b2, cc:b2->b1
+        {
+            int b2 = taskBeam[cc];
+            int idi2 = a * numBeam + b2, idi1 = a * numBeam + b1;
+            int idk1 = cc * numBeam + b1, idk2 = cc * numBeam + b2;
+            Hx1 += taskHashW1[idi2] - taskHashW1[idi1] + taskHashW1[idk1] - taskHashW1[idk2];
+            Hx2 += taskHashW2[idi2] - taskHashW2[idi1] + taskHashW2[idk1] - taskHashW2[idk2];
+            Hx3 += taskHashW3[idi2] - taskHashW3[idi1] + taskHashW3[idk1] - taskHashW3[idk2];
+        }
+    }
+}
 
-    int ts_depth = 300;              // non-improving iterations before a phase ends (triggers perturb)
+void local_search(double beginTime)
+{
+    int ts_depth   = 300;   // 连续无改进迭代数达到此值则结束本阶段
     int nonImprove = 0;
-    double lsStart = (double)clock();
 
-    for (int j = 0; j < numTask; j++) tabuUntil[j] = 0;
-    for (int b = 0; b < numBeam; b++) tabuBeamMode[b] = 0;
-    tabuIter = 0;
+    // 基于解禁忌：持久哈希全程不清空；这里只重算当前(扰动后)解的哈希并登记
+    compute_hash();
+    mark_current();
 
     while (nonImprove < ts_depth)
     {
-        g_lsIters++;
         if (((double)clock() - beginTime) / CLOCKS_PER_SEC > maxRunTime)
             break;
 
-        int bestDelta = MININT_MOVE;     // allow 0 / negative moves (tabu search)
-        int numBest   = 0;               // number of candidates tied at bestDelta
+        int bestDelta = MININT_MOVE;     // 允许 0 / 负收益移动（禁忌搜索）
+        int numBest   = 0;               // 与 bestDelta 持平的候选数量
         int kind = 0, a = -1, bb = -1, cc = -1;
 
-        // ---- rebuild CSR buckets: served tasks grouped by beam ----------
-        // counting sort over taskBeam, O(numTask + numBeam) per iteration.
+        // ---- 重建 CSR 桶：按波束分组已服务任务（计数排序）----
         for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
         for (int j = 0; j < numTask; j++)
             if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
         for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
-        // fill: walk a local cursor per beam (reuse the bucket as cursor base)
         for (int j = 0; j < numTask; j++)
             if (taskBeam[j] >= 0)
             {
                 int b = taskBeam[j];
                 bucketTask[bucketStart[b]++] = j;
             }
-        // undo the cursor advance so bucketStart[b] points at beam b's start again
         for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
         bucketStart[0] = 0;
 
-        // (1) insert unserved task ----------------------------------
+        // 注：compatBucket（按 源波束×候选模式 分组）只被 kind5 用，构建延迟到
+        // 下方 if(bestDelta<=0) 块内，避免在有严格改进的迭代上白白重建 O(N·M)。
+
+        // ---- 按任务类型列出兼容波束（波束编号升序）----
+        for (int t = 0; t < numType; t++) typeCompatBeamCount[t] = 0;
+        for (int b = 0; b < numBeam; b++)
+            if (beamMode[b] >= 0)
+                for (int t = 0; t < numType; t++)
+                    if (typeCompatMode[t][beamMode[b]])
+                        typeCompatBeam[t][typeCompatBeamCount[t]++] = b;
+
+        //----------------------------------------------------------------
+        // (1) 插入：将未服务任务装入兼容波束
+        //----------------------------------------------------------------
         for (int j = 0; j < numTask; j++)
         {
             if (taskBeam[j] != -1) continue;
             int delta = taskProfit[j];
-            // Aspiration: a tabu insert is admitted only if it would push the
-            // current solution past the phase-best profit.
-            int jTabu = (tabuIter < tabuUntil[j]);
-            if (jTabu)
+
+            int t = taskType[j] - 1;
+            for (int p = 0; p < typeCompatBeamCount[t]; p++)
             {
-                if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
-                else { g_tabuBlock++; continue; }
-            }
-            for (int b = 0; b < numBeam; b++)
-            {
+                int b = typeCompatBeam[t][p];
                 if (!feasible_on(j, b)) continue;
-                if (delta < bestDelta) continue;
+                if (delta < bestDelta)  continue;
+
+                // 基于解禁忌：候选解（装入 j→b）是否已访问
+                int idx = j * numBeam + b;
+                if (is_visited(Hx1 + taskHashW1[idx],
+                               Hx2 + taskHashW2[idx],
+                               Hx3 + taskHashW3[idx]))
+                    continue;
                 record_candidate(1, j, b, -1, delta,
                                  bestDelta, numBest, kind, a, bb, cc);
             }
         }
 
-        // (2) swap: unserved i replaces served k on the same beam -------
-        //     For each unserved i, only visit beams whose mode is compatible
-        //     with i, and within such a beam only its served tasks (bucket),
-        //     instead of rescanning every task.  Same (i,k) pairs as before.
+        //----------------------------------------------------------------
+        // (2) 仅删除：移除一个已服务任务
+        //----------------------------------------------------------------
+        for (int j = 0; j < numTask; j++)
+        {
+            if (taskBeam[j] < 0) continue;
+            int delta = -taskProfit[j];
+            if (delta < bestDelta) continue;
+
+            // 基于解禁忌：候选解（移除 j）是否已访问
+            int idx = j * numBeam + taskBeam[j];
+            if (is_visited(Hx1 - taskHashW1[idx],
+                           Hx2 - taskHashW2[idx],
+                           Hx3 - taskHashW3[idx]))
+                continue;
+
+            record_candidate(2, j, -1, -1, delta,
+                             bestDelta, numBest, kind, a, bb, cc);
+        }
+
+        //----------------------------------------------------------------
+        // (3) 交换：未服务任务 i 替换同波束上已服务任务 k
+        //----------------------------------------------------------------
         for (int i = 0; i < numTask; i++)
         {
             if (taskBeam[i] != -1) continue;
-            int iTabu = (tabuIter < tabuUntil[i]);
             int ti = taskType[i] - 1;
-            for (int b = 0; b < numBeam; b++)
+            for (int p = 0; p < typeCompatBeamCount[ti]; p++)
             {
-                if (beamMode[b] < 0) continue;
-                if (!typeCompatMode[ti][beamMode[b]]) continue;
+                int b = typeCompatBeam[ti][p];
 
                 int bwFree0 = remBW[b];
                 int pwFree0 = remPW[b];
@@ -718,18 +867,18 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
                     int delta = taskProfit[i] - taskProfit[k];
                     if (delta < bestDelta) continue;
 
-                    // Aspiration: a swap whose i or k is tabu is admitted only
-                    // if it would beat the phase-best profit.
-                    if (iTabu || tabuIter < tabuUntil[k])
-                    {
-                        if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
-                        else continue;
-                    }
-
-                    // feasibility after removing k, adding i (same beam b)
+                    // 去掉 k、装入 i 后的可行性（同波束 b）
                     int bwFree = bwFree0 + taskBWDemand[k];
                     int pwFree = pwFree0 + taskPWDemand[k];
                     if (taskBWDemand[i] > bwFree || taskPWDemand[i] > pwFree) continue;
+
+                    // 基于解禁忌：候选解（i 入 b、k 出 b）是否已访问
+                    int idi = i * numBeam + b;
+                    int idk = k * numBeam + b;
+                    if (is_visited(Hx1 + taskHashW1[idi] - taskHashW1[idk],
+                                   Hx2 + taskHashW2[idi] - taskHashW2[idk],
+                                   Hx3 + taskHashW3[idi] - taskHashW3[idk]))
+                        continue;
 
                     record_candidate(3, i, b, k, delta,
                                      bestDelta, numBest, kind, a, bb, cc);
@@ -737,8 +886,10 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             }
         }
 
-        // (4) mode-flip: switch one beam's mode, evicting only tasks
-        //     incompatible with the new mode.  No refill is evaluated here.
+        //----------------------------------------------------------------
+        // (4) 模式翻转：切换某波束模式，仅驱逐与新模式不兼容的任务
+        //     （此处不评估回填）
+        //----------------------------------------------------------------
         for (int b = 0; b < numBeam; b++)
         {
             if (beamMode[b] < 0) continue;
@@ -754,117 +905,143 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
                     if (!typeCompatMode[t][m2]) loss += typeProfitSum[b][t];
 
                 int evictPW = 0;
-                int evictTabu = 0;
+                long long evW1 = 0, evW2 = 0, evW3 = 0;   // 被驱逐任务的权重和
                 for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
                 {
                     int j = bucketTask[idx];
                     if (taskBeam[j] == b && !typeCompatMode[taskType[j] - 1][m2])
                     {
                         evictPW += taskPWDemand[j];
-                        if (tabuIter < tabuUntil[j]) evictTabu = 1;
+                        int idj = j * numBeam + b;
+                        evW1 += taskHashW1[idj];
+                        evW2 += taskHashW2[idj];
+                        evW3 += taskHashW3[idj];
                     }
                 }
                 if (usedPW - evictPW > beamPWCap[b] - modeBasePower[m2]) continue;
 
                 int delta = -loss;
-                int tabuFlip = (tabuIter < tabuBeamMode[b]) || evictTabu;
-                if (tabuFlip)
-                {
-                    if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
-                    else { g_tabuBlock++; continue; }
-                }
-
-                g_flipCand++;
                 if (delta < bestDelta) continue;
+
+                // 基于解禁忌：候选解（波束 b 模式 m1->m2 并驱逐不兼容任务）是否已访问
+                int bidx  = b * numMode + m2;
+                int bidx0 = b * numMode + beamMode[b];
+                if (is_visited(Hx1 + beamHashW1[bidx] - beamHashW1[bidx0] - evW1,
+                               Hx2 + beamHashW2[bidx] - beamHashW2[bidx0] - evW2,
+                               Hx3 + beamHashW3[bidx] - beamHashW3[bidx0] - evW3))
+                    continue;
+
                 record_candidate(4, b, m2, -1, delta,
                                  bestDelta, numBest, kind, a, bb, cc);
             }
         }
 
-        // (5) cross-beam exchange with a dynamic dummy slot --------------
-        //     real-real:  served i on b1 swaps beam with served k on b2.
-        //     real-dummy: served i on b1 relocates to b2; cc == -1 records
-        //     the temporary dummy(b2).  Dummy is not stored in taskBeam[].
-        //     Since every kind=5 move has delta=0, skip this neighbourhood
-        //     when a strictly improving move is already available.
+        //----------------------------------------------------------------
+        // (5) 跨波束交换（含动态虚拟槽）。
+        //     real-dummy：b1 上已服务任务 i 迁到 b2（cc == -1）。
+        //     real-real ：b1 上 i 与 b2 上 k 互换波束。
+        //     所有 kind=5 移动的 delta=0，故仅当尚无严格改进移动时才探索。
+        //----------------------------------------------------------------
         if (bestDelta <= 0)
         {
             rebuild_insert_filter();
+
+            // ---- 按（源波束，候选目标模式）分组已服务任务（仅 kind5 需要，延迟到此构建）----
+            for (int x = 0; x <= numBeam * numMode; x++) compatBucketStart[x] = 0;
+            for (int j = 0; j < numTask; j++)
+                if (taskBeam[j] >= 0)
+                {
+                    int b = taskBeam[j];
+                    int t = taskType[j] - 1;
+                    for (int m = 0; m < numMode; m++)
+                        if (typeCompatMode[t][m])
+                            compatBucketStart[b * numMode + m + 1]++;
+                }
+            for (int x = 0; x < numBeam * numMode; x++)
+                compatBucketStart[x + 1] += compatBucketStart[x];
+            for (int j = 0; j < numTask; j++)
+                if (taskBeam[j] >= 0)
+                {
+                    int b = taskBeam[j];
+                    int t = taskType[j] - 1;
+                    for (int m = 0; m < numMode; m++)
+                        if (typeCompatMode[t][m])
+                            compatBucketTask[compatBucketStart[b * numMode + m]++] = j;
+                }
+            for (int x = numBeam * numMode; x > 0; x--)
+                compatBucketStart[x] = compatBucketStart[x - 1];
+            compatBucketStart[0] = 0;
 
             for (int i = 0; i < numTask; i++)
             {
                 int b1 = taskBeam[i];
                 if (b1 < 0) continue;
 
-                int iTabu = (tabuIter < tabuUntil[i]);
-                if (iTabu)
-                {
-                    if (totalProfit > bestProfit) { /* aspiration: admit */ }
-                    else { g_tabuBlock++; continue; }
-                }
-
                 int ti = taskType[i] - 1;
-                for (int b2 = 0; b2 < numBeam; b2++)
+                for (int p = 0; p < typeCompatBeamCount[ti]; p++)
                 {
+                    int b2 = typeCompatBeam[ti][p];
                     if (b2 == b1) continue;
-                    if (beamMode[b2] < 0) continue;
-                    if (!typeCompatMode[ti][beamMode[b2]]) continue;
 
                     int delta = 0;
 
-                    // real-dummy: move i from b1 to the current free slot on b2.
+                    // real-dummy：i 从 b1 迁到 b2 当前空位，
+                    // 且 b1 腾出 i 后须能装入某个未服务任务
                     if (taskBWDemand[i] <= remBW[b2] &&
                         taskPWDemand[i] <= remPW[b2])
                     {
-                        if (!beam_can_insert_unserved_with_rem(
+                        if (beam_can_insert_unserved_with_rem(
                                 b1,
                                 remBW[b1] + taskBWDemand[i],
                                 remPW[b1] + taskPWDemand[i]))
                         {
-                            g_crossFiltered++;
-                        }
-                        else
-                        {
-                            g_crossCand++;
-                            g_crossRelocCand++;
-                            record_candidate(5, i, b2, -1, delta,
-                                             bestDelta, numBest, kind, a, bb, cc);
+                            // 基于解禁忌：候选解（i 从 b1 迁到 b2）是否已访问
+                            int idi2 = i * numBeam + b2;
+                            int idi1 = i * numBeam + b1;
+                            if (!is_visited(Hx1 + taskHashW1[idi2] - taskHashW1[idi1],
+                                            Hx2 + taskHashW2[idi2] - taskHashW2[idi1],
+                                            Hx3 + taskHashW3[idi2] - taskHashW3[idi1]))
+                                record_candidate(5, i, b2, -1, delta,
+                                                 bestDelta, numBest, kind, a, bb, cc);
                         }
                     }
 
-                    // real-real: enumerate each cross-beam pair once.
+                    // real-real：每对跨波束组合只枚举一次
                     if (b1 > b2) continue;
 
-                    for (int idx = bucketStart[b2]; idx < bucketStart[b2 + 1]; idx++)
+                    int m1 = beamMode[b1];
+                    if (m1 < 0) continue;
+                    int dstStart = compatBucketStart[b2 * numMode + m1];
+                    int dstEnd   = compatBucketStart[b2 * numMode + m1 + 1];
+                    for (int q = dstStart; q < dstEnd; q++)
                     {
-                        int k = bucketTask[idx];
-                        int tk = taskType[k] - 1;
+                        int k = compatBucketTask[q];
 
-                        if (!typeCompatMode[tk][beamMode[b1]]) continue;
                         if (taskBWDemand[k] > remBW[b1] + taskBWDemand[i]) continue;
                         if (taskPWDemand[k] > remPW[b1] + taskPWDemand[i]) continue;
                         if (taskBWDemand[i] > remBW[b2] + taskBWDemand[k]) continue;
                         if (taskPWDemand[i] > remPW[b2] + taskPWDemand[k]) continue;
 
-                        if (tabuIter < tabuUntil[k])
-                        {
-                            if (totalProfit > bestProfit) { /* aspiration: admit */ }
-                            else { g_tabuBlock++; continue; }
-                        }
-
+                        // 仅当交换后至少一侧能装入未服务任务时才保留
                         int b1BW = remBW[b1] + taskBWDemand[i] - taskBWDemand[k];
                         int b1PW = remPW[b1] + taskPWDemand[i] - taskPWDemand[k];
                         int b2BW = remBW[b2] + taskBWDemand[k] - taskBWDemand[i];
                         int b2PW = remPW[b2] + taskPWDemand[k] - taskPWDemand[i];
                         if (!beam_can_insert_unserved_with_rem(b1, b1BW, b1PW) &&
                             !beam_can_insert_unserved_with_rem(b2, b2BW, b2PW))
-                        {
-                            g_crossFiltered++;
                             continue;
-                        }
 
-                        g_crossCand++;
-                        g_crossSwapCand++;
+                        // 基于解禁忌：候选解（i:b1->b2，k:b2->b1 互换）是否已访问
+                        int idi2 = i * numBeam + b2;
+                        int idi1 = i * numBeam + b1;
+                        int idk1 = k * numBeam + b1;
+                        int idk2 = k * numBeam + b2;
+                        if (is_visited(
+                                Hx1 + taskHashW1[idi2] - taskHashW1[idi1] + taskHashW1[idk1] - taskHashW1[idk2],
+                                Hx2 + taskHashW2[idi2] - taskHashW2[idi1] + taskHashW2[idk1] - taskHashW2[idk2],
+                                Hx3 + taskHashW3[idi2] - taskHashW3[idi1] + taskHashW3[idk1] - taskHashW3[idk2]))
+                            continue;
+
                         record_candidate(5, i, b2, k, delta,
                                          bestDelta, numBest, kind, a, bb, cc);
                     }
@@ -872,60 +1049,45 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             }
         }
 
-        // ---- no admissible candidate in this iteration: advance tabu time ----
+        // ---- 本迭代无可行非禁忌候选：本段已无路可走，结束本段交给扰动 ----
+        // （解不变则下次扫描结果相同，空转无意义；持久禁忌下此情形会随表变满更常见）
         if (numBest == 0)
-        {
-            g_lsStall++;
-            nonImprove++;
-            tabuIter++;
-            continue;
-        }
-        g_lsMoves++;
-        // count an aspiration whenever the committed move broke a task/beam tabu
-        if ((kind == 1 && tabuIter < tabuUntil[a]) ||
-            (kind == 3 && (tabuIter < tabuUntil[a] || tabuIter < tabuUntil[cc])) ||
-            (kind == 4 && tabuIter < tabuBeamMode[a]) ||
-            (kind == 5 && (tabuIter < tabuUntil[a] ||
-                           (cc >= 0 && tabuIter < tabuUntil[cc]))))
-            g_aspire++;
+            break;
 
-        if (kind == 1)                            // insert
+        // 基于解禁忌：用提交前状态增量更新 Hx（替代提交后全量 compute_hash）
+        update_hash_for_move(kind, a, bb, cc);
+
+        // ---- 提交所选移动 ----
+        if (kind == 1)                            // 插入
         {
             add_task(a, bb);
             moveFreq[a]++;
-            tabuUntil[a] = tabuIter + tabu_tenure();
-            g_applyInsert++;
         }
-        else if (kind == 3)                       // swap a in, cc out
+        else if (kind == 2)                       // 仅删除
+        {
+            remove_task(a);
+            moveFreq[a]++;
+        }
+        else if (kind == 3)                       // 交换：装入 a，移出 cc
         {
             remove_task(cc);
             add_task(a, bb);
             moveFreq[a]++; moveFreq[cc]++;
-            tabuUntil[a]  = tabuIter + tabu_tenure();
-            tabuUntil[cc] = tabuIter + tabu_tenure();
-            g_applySwap++;
         }
-        else if (kind == 4)                       // mode-flip beam a to mode bb
+        else if (kind == 4)                       // 模式翻转：波束 a 切换到模式 bb
         {
-            int tenure = tabu_tenure();
-            apply_mode_flip(a, bb, tenure);
-            tabuBeamMode[a] = tabuIter + tenure;
-            g_applyFlip++;
-            g_flipApplied++;
-            if (bb >= 0 && bb < 16) g_flipApplyToMode[bb]++;
+            apply_mode_flip(a, bb);
         }
-        else if (kind == 5)                       // cross-beam exchange with dummy
+        else if (kind == 5)                       // 跨波束交换
         {
             int b1 = taskBeam[a];
-            if (cc < 0)                           // real-dummy: relocate a to bb
+            if (cc < 0)                           // real-dummy：将 a 迁到 bb
             {
                 remove_task(a);
                 add_task(a, bb);
                 moveFreq[a]++;
-                tabuUntil[a] = tabuIter + tabu_tenure();
-                g_crossRelocApplied++;
             }
-            else                                  // real-real: swap a and cc
+            else                                  // real-real：a 与 cc 互换
             {
                 int b2 = taskBeam[cc];
                 remove_task(a);
@@ -933,12 +1095,12 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
                 add_task(a, b2);
                 add_task(cc, b1);
                 moveFreq[a]++; moveFreq[cc]++;
-                tabuUntil[a]  = tabuIter + tabu_tenure();
-                tabuUntil[cc] = tabuIter + tabu_tenure();
-                g_crossSwapApplied++;
             }
-            g_applyCross++;
         }
+
+        // 基于解禁忌：登记新解为已访问（Hx 已在提交前增量更新）
+        mark_current();
+
         if (totalProfit > bestProfit)
         {
             save_best(beginTime);
@@ -946,68 +1108,50 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         }
         else
             nonImprove++;
-
-        tabuIter++;
     }
-    g_lsTime += ((double)clock() - lsStart) / CLOCKS_PER_SEC;
 }
 
-//--------------------------------------------------------------------
-// perturb  (destroy + repair)
+//====================================================================
+// 扰动（破坏 + 修复），用于 ILS 阶段
 //
-// Starting from the current phase-best solution:
+//  破坏：清空 30% 波束，优先选本阶段局部搜索中任务移动最少的波束
+//  （moveFreq 低），将搜索推向未探索区域。被清空的波束模式重置为 -1。
 //
-//  Destroy: pick 35% of the beams, strip every
-//  task off them (back to the unserved pool) and reset their mode to -1
-//  ("empty"), leaving a partial solution.  Untouched beams keep both
-//  their mode and their assigned tasks.
+//  修复（模式）：按顺序重定每个被清空波束的模式。枚举功率可行模式，
+//  从当前未服务池试填，通常保留实际收益增量最大的模式；以 20% 概率
+//  选用次优模式以增加多样性。
 //
-//  Repair (modes): redecide emptied beams sequentially.  For one beam,
-//  enumerate its power-feasible modes, temporarily fill that beam from
-//  the current unserved pool, and usually keep the mode whose committed
-//  repair gives the largest actual profit increase.  With small
-//  probability the second-best mode is used to avoid deterministic
-//  repair undoing the destroy step.  The chosen mode/tasks are committed
-//  before repairing the next emptied beam, so tasks cannot be counted by
-//  multiple beams during mode choice.
-//
-//  Repair (tasks): greedily reassign the still-unserved tasks, ordered
-//  by the existing best-attainable priority key.  For each task, try
-//  compatible beam modes from low base-power to high base-power first;
-//  within the chosen mode tier, keep the original tightest-BW fit rule.
-//--------------------------------------------------------------------
+//  修复（任务）：按优先级贪心重分配仍未服务的任务，兼容模式从低基础
+//  功耗到高依次尝试，同档内选剩余带宽最紧的波束。
+//====================================================================
 void perturb(int *tmpIdx, double *tmpVal)
 {
     restore_best();
     if (numBeam == 0) return;
 
-    //---- destroy: empty 30% of the beams, preferring those whose served
-    //     tasks were moved least during the last local search (low
-    //     moveFreq) so the search is pushed toward unexplored regions ----
-    int numDestroy = (int)(0.30 * numBeam + 0.5);
+    int numDestroy = divStrength;             // 动态多样化强度（由 ils 维护）
     if (numDestroy < 1)        numDestroy = 1;
     if (numDestroy > numBeam)  numDestroy = numBeam;
 
-    // per-beam frequency key = sum of moveFreq over its served tasks
-    int    *perturbBeam = new int[numBeam];      // scratch: beams chosen to empty
-    int    *prevMode    = new int[numBeam];      // mode each emptied beam had before destroy
-    double *beamFreqKey = new double[numBeam];
-    int    *order       = new int[numBeam];
+    int    *perturbBeam = new int[numBeam];      // 被选为清空的波束
+    int    *prevMode    = new int[numBeam];      // 破坏前各波束的模式
+    double *beamFreqKey  = new double[numBeam];   // 各波束上已服务任务 moveFreq 之和
+    int    *order        = new int[numBeam];
     for (int b = 0; b < numBeam; b++) { beamFreqKey[b] = 0.0; order[b] = b; }
     for (int j = 0; j < numTask; j++)
         if (taskBeam[j] >= 0) beamFreqKey[taskBeam[j]] += moveFreq[j];
 
-    // sort beams ascending by frequency: qsort_desc on the negated key
+    // 按频率升序排序：对键取负后用 qsort_desc
     for (int b = 0; b < numBeam; b++) beamFreqKey[b] = -beamFreqKey[b];
-    qsort_desc(beamFreqKey, order, 0, numBeam - 1);   // order[]: low-freq first
+    qsort_desc(beamFreqKey, order, 0, numBeam - 1);   // order[]：低频在前
 
-    // pool of least-moved beams to draw from (at least numDestroy wide)
+    // 从最少移动的波束中抽取（池宽至少为 numDestroy）
     int poolSize = 0;
     for (int b = 0; b < numBeam; b++) if (beamFreqKey[b] == 0.0) poolSize++;
     if (poolSize < numDestroy) poolSize = numDestroy;
 
-    // draw numDestroy distinct beams at random from the low-frequency pool
-    for (int k = 0; k < numDestroy; k++)             // partial Fisher-Yates
+    // 从低频池中随机抽取 numDestroy 个互不相同的波束
+    for (int k = 0; k < numDestroy; k++)             // 部分 Fisher-Yates 洗牌
     {
         int r   = k + rand() % (poolSize - k);
         int tmp = order[k]; order[k] = order[r]; order[r] = tmp;
@@ -1017,17 +1161,17 @@ void perturb(int *tmpIdx, double *tmpVal)
     for (int k = 0; k < numDestroy; k++)
     {
         int b = perturbBeam[k];
-        prevMode[k] = beamMode[b];                  // remember old mode; repair may choose it again
+        prevMode[k] = beamMode[b];                  // 记录原模式
         for (int j = 0; j < numTask; j++)
             if (taskBeam[j] == b) remove_task(j);
         beamMode[b] = -1;
         remBW[b]    = beamBWCap[b];
-        remPW[b]    = 0;                             // set once mode is redecided
+        remPW[b]    = 0;                             // 重定模式后再设置
     }
 
-    //---- repair modes: sequential actual-profit trial ----------------
-    int *trialAdded = new int[numTask];
-    int *bestAdded  = new int[numTask];
+    //---- 修复模式：按实际收益试填并顺序提交 ----
+    int *trialAdded  = new int[numTask];
+    int *bestAdded   = new int[numTask];
     int *secondAdded = new int[numTask];
     for (int k = 0; k < numDestroy; k++)
     {
@@ -1042,7 +1186,7 @@ void perturb(int *tmpIdx, double *tmpVal)
 
         for (int m = 0; m < numMode; m++)
         {
-            if (modeBasePower[m] > beamPWCap[b]) continue;       // power infeasible
+            if (modeBasePower[m] > beamPWCap[b]) continue;       // 功率不可行
 
             beamMode[b] = m;
             remBW[b]    = beamBWCap[b];
@@ -1091,20 +1235,17 @@ void perturb(int *tmpIdx, double *tmpVal)
             for (int a = nTrialAdded - 1; a >= 0; a--) remove_task(trialAdded[a]);
         }
 
-        if (bestM < 0)                       // no power-feasible mode: take the cheapest
-        {                                    // base-power mode available
-            bestM = -1;
+        if (bestM < 0)                       // 无功率可行模式：选基础功耗最低者
+        {
             for (int m = 0; m < numMode; m++)
-            {
                 if (bestM < 0 || modeBasePower[m] < modeBasePower[bestM]) bestM = m;
-            }
-            if (bestM < 0) bestM = prevMode[k];   // only one mode exists: unavoidable
+            if (bestM < 0) bestM = prevMode[k];   // 仅一种模式时无法避免
         }
 
         int chosenM      = bestM;
         int *chosenAdded = bestAdded;
         int nChosenAdded = nBestAdded;
-        if (secondM >= 0 && rand() % 5 == 0)  // 20%: diversify repair
+        if (secondM >= 0 && rand() % 5 == 0)  // 20%：修复多样化
         {
             chosenM      = secondM;
             chosenAdded  = secondAdded;
@@ -1123,7 +1264,7 @@ void perturb(int *tmpIdx, double *tmpVal)
     delete[] bestAdded;
     delete[] secondAdded;
 
-    //---- repair tasks: greedy best-fit by score ----------------------
+    //---- 修复任务：按优先级贪心最佳适配 ----
     int nFree = 0;
     for (int j = 0; j < numTask; j++)
         if (taskBeam[j] == -1)
@@ -1142,12 +1283,12 @@ void perturb(int *tmpIdx, double *tmpVal)
         int bestBeam   = -1;
         int bestLeftBW = -1;
 
+        // 任务 j 的兼容模式，按基础功耗升序（插入排序）
         int t = taskType[j] - 1;
         int numCompatMode = 0;
         for (int m = 0; m < numMode; m++)
         {
             if (!typeCompatMode[t][m]) continue;
-
             int pos = numCompatMode;
             while (pos > 0 && modeBasePower[m] < modeBasePower[modeOrder[pos - 1]])
             {
@@ -1182,6 +1323,9 @@ void perturb(int *tmpIdx, double *tmpVal)
     delete[] order;
 }
 
+//====================================================================
+// 迭代局部搜索主流程
+//====================================================================
 void ils()
 {
     double beginTime = (double)clock();
@@ -1192,7 +1336,7 @@ void ils()
     greedy_init();
     alloc_search();
 
-    // full rebuild of typeProfitSum to guarantee consistency before ILS
+    // ILS 开始前全量重建 typeProfitSum，保证与当前解一致
     for (int b = 0; b < numBeam; b++)
         for (int t = 0; t < numType; t++) typeProfitSum[b][t] = 0;
     for (int j = 0; j < numTask; j++)
@@ -1201,88 +1345,46 @@ void ils()
 
     globalProfit = -1;
 
-    probe_modes("after_greedy");
+    // 动态多样化强度（学 MNSB-TS）：弱强度起步，刷新全局即回弱，连续停滞则渐强
+    int weakDestroy = (int)(0.10 * numBeam + 0.5);
+    if (weakDestroy < 1) weakDestroy = 1;
+    divStrength = weakDestroy;
 
     double runTime = 0.0;
-    long   numPhase = 0;
     while (runTime < maxRunTime)
     {
         for (int j = 0; j < numTask; j++) moveFreq[j] = 0;
 
-        save_best(beginTime);          // phase-best starts from the current solution
-        local_search(beginTime, tmpIdx, tmpVal);
-        numPhase++;
-
-        if (numPhase == 1) probe_modes("after_LS1");
+        save_best(beginTime);          // 本阶段最优从当前解出发
+        local_search(beginTime);
 
         if (bestProfit > globalProfit)
         {
             save_global_from_best();
-            cout << "  globalProfit=" << globalProfit
-                 << "  time=" << globalBestTime << " s"
-                 << "  phase=" << numPhase << endl;
+            divStrength = weakDestroy;          // 逃出(刷新全局)→ 回到弱扰动
+        }
+        else
+        {
+            divStrength++;                       // 没逃出 → 破坏强度渐增
+            if (divStrength > numBeam) divStrength = weakDestroy;  // 到顶后回弱，循环覆盖各尺度
         }
 
-        double pStart = (double)clock();
         perturb(tmpIdx, tmpVal);
-        g_perturbTime += ((double)clock() - pStart) / CLOCKS_PER_SEC;
 
         runTime = ((double)clock() - beginTime) / CLOCKS_PER_SEC;
     }
 
-    // install the global best as the final solution for checking / printing
+    // 将全局最优作为最终解，供校验与输出
     restore_global();
     totalProfit = globalProfit;
 
-    probe_modes("final");
-
     delete[] tmpIdx;
     delete[] tmpVal;
-
-    cout << "ILS done.  bestProfit=" << globalProfit
-         << "  bestTime=" << globalBestTime << " s"
-         << "  phases=" << numPhase << endl;
-    cout << "Perturbations over the whole run: " << numPhase << endl;
-
-    // ---- profiling report ----
-    double totalLS = g_lsTime + g_perturbTime;
-    cout << "[PROFILE] phases=" << numPhase
-         << "  ls_iters=" << g_lsIters
-         << "  moves=" << g_lsMoves
-         << "  stalls=" << g_lsStall << endl;
-    cout << "[PROFILE] iters_per_phase=" << (numPhase ? (double)g_lsIters / numPhase : 0)
-         << "  move_rate=" << (g_lsIters ? 100.0 * g_lsMoves / g_lsIters : 0) << "%"
-         << "  stall_rate=" << (g_lsIters ? 100.0 * g_lsStall / g_lsIters : 0) << "%" << endl;
-    cout << "[PROFILE] tabu_blocks=" << g_tabuBlock
-         << "  aspirations=" << g_aspire << endl;
-    cout << "[PROFILE] ls_time=" << g_lsTime << "s (" << (totalLS ? 100.0 * g_lsTime / totalLS : 0) << "%)"
-         << "  perturb_time=" << g_perturbTime << "s (" << (totalLS ? 100.0 * g_perturbTime / totalLS : 0) << "%)" << endl;
-    cout << "[PROFILE] us_per_ls_iter=" << (g_lsIters ? 1e6 * g_lsTime / g_lsIters : 0) << endl;
-    cout << "[PROFILE] move_applied:"
-         << " insert=" << g_applyInsert
-         << " remove=" << g_applyRemove
-         << " swap=" << g_applySwap
-         << " flip=" << g_applyFlip
-         << " cross=" << g_applyCross << endl;
-    cout << "[PROFILE] cross_cand=" << g_crossCand
-         << " reloc_cand=" << g_crossRelocCand
-         << " swap_cand=" << g_crossSwapCand
-         << " filtered=" << g_crossFiltered
-         << " reloc_applied=" << g_crossRelocApplied
-         << " swap_applied=" << g_crossSwapApplied << endl;
-    cout << "[PROFILE] flip_cand=" << g_flipCand
-         << "  applied=" << g_flipApplied
-         << " (" << (g_lsMoves ? 100.0 * g_flipApplied / g_lsMoves : 0) << "% of moves)" << endl;
-    cout << "[PROFILE] flip_applied_by_mode:";
-    for (int m = 0; m < numMode && m < 16; m++)
-        cout << " " << modeName[m] << "=" << g_flipApplyToMode[m];
-    cout << endl;
-
 }
 
-//--------------------------------------------------------------------
-// check_solution: verify all constraints and profit consistency
-//--------------------------------------------------------------------
+//====================================================================
+// 最终校验与输出
+//====================================================================
 void check_solution()
 {
     int  checkProfit = 0;
@@ -1298,7 +1400,6 @@ void check_solution()
         int b = taskBeam[j];
         int t = taskType[j] - 1;
 
-        // mode-compatibility
         if (!typeCompatMode[t][beamMode[b]])
         {
             cout << "ERROR: task " << j << " (type " << (t + 1)
@@ -1346,13 +1447,11 @@ void check_solution()
     delete[] usedPW;
 }
 
-//--------------------------------------------------------------------
-// print_solution: human-readable summary
-//--------------------------------------------------------------------
 void print_solution()
 {
     cout << "\n=== Solution Summary ===" << endl;
     cout << "Total profit : " << totalProfit << endl;
+    cout << "Best time    : " << globalBestTime << " s" << endl;
 
     int numServed = 0;
     for (int j = 0; j < numTask; j++)
@@ -1373,9 +1472,6 @@ void print_solution()
     }
 }
 
-//--------------------------------------------------------------------
-// free_memory
-//--------------------------------------------------------------------
 void free_memory()
 {
     for (int m = 0; m < numMode; m++)  delete[] modeName[m];
@@ -1402,20 +1498,33 @@ void free_memory()
     delete[] globalBeamMode;
     delete[] globalTaskBeam;
     delete[] moveFreq;
-    delete[] tabuUntil;
     delete[] bucketTask;
     delete[] bucketStart;
+    delete[] compatBucketTask;
+    delete[] compatBucketStart;
+    for (int t = 0; t < numType; t++) delete[] typeCompatBeam[t];
+    delete[] typeCompatBeam;
+    delete[] typeCompatBeamCount;
     for (int m = 0; m < numMode; m++) delete[] insertMinPW[m];
     delete[] insertMinPW;
 
-    delete[] tabuBeamMode;
     for (int b = 0; b < numBeam; b++) delete[] typeProfitSum[b];
     delete[] typeProfitSum;
+
+    delete[] taskHashW1;
+    delete[] taskHashW2;
+    delete[] taskHashW3;
+    delete[] beamHashW1;
+    delete[] beamHashW2;
+    delete[] beamHashW3;
+    delete[] hashTab1;
+    delete[] hashTab2;
+    delete[] hashTab3;
 }
 
-//--------------------------------------------------------------------
-// main
-//--------------------------------------------------------------------
+//====================================================================
+// 主程序
+//====================================================================
 int main(int argc, char **argv)
 {
     if (argc < 3)
@@ -1427,18 +1536,22 @@ int main(int argc, char **argv)
     seed         = atoi(argv[2]);
     srand(seed);
 
-    maxRunTime = 600.0;          // time limit in seconds
+    maxRunTime = 600.0;          // 默认时间上限（秒）
     if (argc >= 4) maxRunTime = atof(argv[3]);
 
-    double t0 = (double)clock();
-
     read_instance();
+
+    double t0 = (double)clock();
     ils();
+    double elapsed = ((double)clock() - t0) / CLOCKS_PER_SEC;
+
     check_solution();
     print_solution();
 
-    double elapsed = ((double)clock() - t0) / CLOCKS_PER_SEC;
-    cout << "\nElapsed time: " << elapsed << " s" << endl;
+    // 批处理脚本解析用的摘要行（best_profit / best_time / elapsed_time）
+    cout << "ILS done.  bestProfit=" << globalProfit
+         << "  bestTime=" << globalBestTime << " s" << endl;
+    cout << "Elapsed time: " << elapsed << " s" << endl;
 
     free_memory();
     return 0;
