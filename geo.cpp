@@ -10,6 +10,8 @@
 #define MAXTYPE     20          // 任务类型数量上限
 #define MAXNAMELEN  32          // 模式名称最大长度
 #define MININT_MOVE (-2000000000)   // 禁忌搜索中 delta 的“负无穷”初值
+#define EC_MAXLEN   25          // 喷射链最大长度（链上 shift 步数上限）
+#define EC_START_CAP 64         // 每次局部搜索尝试的链头（未服务任务）数量上限
 
 using namespace std;
 
@@ -80,6 +82,33 @@ char *hashTab1, *hashTab2, *hashTab3;        // [HASH_L]：访问过的解(全�
 long long Hx1, Hx2, Hx3;                     // 当前解的三路哈希和
 
 int divStrength;      // 动态多样化强度：本次扰动要破坏的波束数（学 MNSB-TS：逃出回弱、停滞渐强）
+
+//====================================================================
+// 喷射链（ejection chain）邻域的工作区
+//====================================================================
+// 单孤儿喷射链：从一个未服务任务出发，塞入兼容波束并踢出单个任务，被踢任务
+// 成为新孤儿继续级联。链尾「空位收尾」净收益 = profit[链头]（严格 +1 个任务），
+// 「丢弃收尾」净收益 = profit[链头] - profit[孤儿]。链只动任务-波束变量（不改模式），
+// 故哈希增量只涉及 taskHashW*。整链在 scratch 资源上试算，命中后才回放提交。
+int *ecWRemBW, *ecWRemPW;     // [numBeam]：链试算用的剩余带宽/功率（不污染全局）
+long long *ecUsedStamp;       // [numTask]：本链已参与（不可再被踢）的代标记
+long long  ecGen;             // 代计数器（每条链 +1，免清零；long long 防溢出）
+int  ecMaxLen;                // 链长上限
+int  ecCfgLen   = EC_MAXLEN;     // 可由 EC_LEN 覆盖
+int  ecCfgCap   = EC_START_CAP;  // 可由 EC_CAP 覆盖
+int  ecCfgEvery = 1;             // 每隔多少个平台迭代跑一次链（EC_EVERY 覆盖）
+int *ecOpTask, *ecOpBeam;     // 当前链的操作序列（Beam=-1 删除，>=0 加入波束）
+int  ecOpCount;               // 当前链操作数
+int *ecBestOpTask, *ecBestOpBeam; // 本次局搜采纳的最优链操作序列
+int  ecBestOpCount;
+long long ecBestDH1, ecBestDH2, ecBestDH3;   // 最优链的三路哈希增量
+int  ecBestGain;              // 最优链净收益（>0 才采纳）
+int *ecStartIdx;              // [numTask]：链头候选下标
+double *ecStartVal;           // [numTask]：链头排序键（收益）
+
+// ---- 诊断计数器（临时，用于定位大算例退化原因）----
+long long g_phases = 0, g_lsIters = 0, g_ecCalls = 0, g_ecCommits = 0, g_ecSteps = 0;
+int g_ecOff = 0;              // EC_OFF=1 时关闭喷射链（用于同二进制对照）
 
 //====================================================================
 // 每步局部搜索重建的加速索引
@@ -644,6 +673,21 @@ void alloc_search()
     hashTab2 = new char[HASH_L];
     hashTab3 = new char[HASH_L];
     init_hash();
+
+    // 喷射链工作区
+    ecMaxLen    = ecCfgLen;
+    ecWRemBW    = new int[numBeam];
+    ecWRemPW    = new int[numBeam];
+    ecUsedStamp = new long long[numTask];
+    for (int j = 0; j < numTask; j++) ecUsedStamp[j] = 0;
+    ecGen = 0;
+    int opCap   = 2 * ecMaxLen + 4;     // 每步 2 个操作 + 收尾 1 个
+    ecOpTask     = new int[opCap];
+    ecOpBeam     = new int[opCap];
+    ecBestOpTask = new int[opCap];
+    ecBestOpBeam = new int[opCap];
+    ecStartIdx   = new int[numTask];
+    ecStartVal   = new double[numTask];
 }
 
 //====================================================================
@@ -758,6 +802,160 @@ void update_hash_for_move(int kind, int a, int bb, int cc)
     }
 }
 
+//====================================================================
+// 喷射链邻域
+//====================================================================
+// ec_select_eject：为孤儿 o 选一个 (波束 b, 被踢任务 g)，要求删掉单个 g 后 o 能装入 b。
+// 优先 profit[g] 最小（丢得最少），平局选腾出余量更大者。返回 g（-1 表示无）。
+// 仅扫描 o 兼容波束、用 scratch 剩余资源 ecWRem* 判可行；被踢任务须本链未用过。
+int ec_select_eject(int o, int &outBeam)
+{
+    int t   = taskType[o] - 1;
+    int bwO = taskBWDemand[o];
+    int pwO = taskPWDemand[o];
+
+    int  bestG = -1, bestB = -1;
+    int  bestGProfit = 2000000000;
+    long bestSlack   = -1;
+
+    for (int p = 0; p < typeCompatBeamCount[t]; p++)
+    {
+        int b = typeCompatBeam[t][p];
+        // 若 b 已能直接装下 o，则属于「空位收尾」，由调用方先行处理，这里不踢人
+        if (ecWRemBW[b] >= bwO && ecWRemPW[b] >= pwO) continue;
+
+        for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
+        {
+            int g = bucketTask[idx];
+            if (ecUsedStamp[g] == ecGen) continue;      // 本链已用，避免环
+            if (g == o)                  continue;
+            if (taskBeam[g] != b)        continue;       // 仅原本就在 b 的任务可踢
+            if (ecWRemBW[b] + taskBWDemand[g] < bwO) continue;
+            if (ecWRemPW[b] + taskPWDemand[g] < pwO) continue;
+
+            int  gp    = taskProfit[g];
+            long slack = (long)(ecWRemBW[b] + taskBWDemand[g] - bwO)
+                       + (long)(ecWRemPW[b] + taskPWDemand[g] - pwO);
+            if (gp < bestGProfit || (gp == bestGProfit && slack > bestSlack))
+            {
+                bestGProfit = gp;
+                bestG       = g;
+                bestB       = b;
+                bestSlack   = slack;
+            }
+        }
+    }
+    outBeam = bestB;
+    return bestG;
+}
+
+// ec_grow：从链头 f 生长一条喷射链，若得到净收益 > ecBestGain 且最终解非禁忌的链，
+// 则更新 ecBest*（操作序列 + 哈希增量 + 收益）。不改动任何全局解状态。
+void ec_grow(int f)
+{
+    ecGen++;
+    for (int b = 0; b < numBeam; b++) { ecWRemBW[b] = remBW[b]; ecWRemPW[b] = remPW[b]; }
+
+    long long dH1 = 0, dH2 = 0, dH3 = 0;
+    ecOpCount = 0;
+    ecUsedStamp[f] = ecGen;
+
+    int orphan = f;
+    int pf     = taskProfit[f];
+
+    for (int step = 0; step <= ecMaxLen; step++)
+    {
+        int t = taskType[orphan] - 1;
+
+        // ---- 收尾 1：空位收尾（孤儿在某兼容波束有现成空位）----
+        int closeB = -1;
+        for (int p = 0; p < typeCompatBeamCount[t]; p++)
+        {
+            int b = typeCompatBeam[t][p];
+            if (ecWRemBW[b] >= taskBWDemand[orphan] &&
+                ecWRemPW[b] >= taskPWDemand[orphan]) { closeB = b; break; }
+        }
+        if (closeB >= 0)
+        {
+            int idx = orphan * numBeam + closeB;
+            long long h1 = Hx1 + dH1 + taskHashW1[idx];
+            long long h2 = Hx2 + dH2 + taskHashW2[idx];
+            long long h3 = Hx3 + dH3 + taskHashW3[idx];
+            if (pf > ecBestGain && !is_visited(h1, h2, h3))
+            {
+                ecBestGain = pf;
+                for (int q = 0; q < ecOpCount; q++)
+                { ecBestOpTask[q] = ecOpTask[q]; ecBestOpBeam[q] = ecOpBeam[q]; }
+                ecBestOpTask[ecOpCount] = orphan;
+                ecBestOpBeam[ecOpCount] = closeB;
+                ecBestOpCount = ecOpCount + 1;
+                ecBestDH1 = h1 - Hx1; ecBestDH2 = h2 - Hx2; ecBestDH3 = h3 - Hx3;
+            }
+            return;     // 空位收尾即为本链头的最大可能收益（+pf），无需再生长
+        }
+
+        // ---- 收尾 2：丢弃收尾（孤儿留作未服务；orphan!=f 时其已在 scratch 上被踢出）----
+        if (orphan != f)
+        {
+            int gain = pf - taskProfit[orphan];
+            if (gain > ecBestGain && !is_visited(Hx1 + dH1, Hx2 + dH2, Hx3 + dH3))
+            {
+                ecBestGain = gain;
+                for (int q = 0; q < ecOpCount; q++)
+                { ecBestOpTask[q] = ecOpTask[q]; ecBestOpBeam[q] = ecOpBeam[q]; }
+                ecBestOpCount = ecOpCount;     // 孤儿保持未服务
+                ecBestDH1 = dH1; ecBestDH2 = dH2; ecBestDH3 = dH3;
+            }
+        }
+
+        if (step == ecMaxLen) break;
+
+        // ---- 生长：踢出单个 g 让孤儿装入 b ----
+        int b;
+        int g = ec_select_eject(orphan, b);
+        if (g < 0) break;
+        g_ecSteps++;
+
+        ecUsedStamp[g] = ecGen;
+        int idO = orphan * numBeam + b;
+        int idG = g      * numBeam + b;
+        ecWRemBW[b] += taskBWDemand[g] - taskBWDemand[orphan];
+        ecWRemPW[b] += taskPWDemand[g] - taskPWDemand[orphan];
+        dH1 += taskHashW1[idO] - taskHashW1[idG];
+        dH2 += taskHashW2[idO] - taskHashW2[idG];
+        dH3 += taskHashW3[idO] - taskHashW3[idG];
+
+        // 操作序列：先删 g，再把孤儿加入 b
+        ecOpTask[ecOpCount] = g;      ecOpBeam[ecOpCount] = -1; ecOpCount++;
+        ecOpTask[ecOpCount] = orphan; ecOpBeam[ecOpCount] = b;  ecOpCount++;
+
+        orphan = g;     // g 的删除已记入 ops，符合下一轮「孤儿已被踢出」的不变量
+    }
+}
+
+// ec_search：扫描若干高收益未服务任务作为链头，留下最优可采纳链于 ecBest*。
+// 返回最优净收益（0 表示无可用链）。需在 bucket / typeCompatBeam 已构建后调用。
+int ec_search()
+{
+    ecBestGain    = 0;
+    ecBestOpCount = 0;
+
+    int nStart = 0;
+    for (int j = 0; j < numTask; j++)
+        if (taskBeam[j] < 0)
+        {
+            ecStartIdx[nStart] = j;
+            ecStartVal[nStart] = (double)taskProfit[j];
+            nStart++;
+        }
+    if (nStart == 0) return 0;
+    qsort_desc(ecStartVal, ecStartIdx, 0, nStart - 1);
+
+    int cap = (nStart < ecCfgCap) ? nStart : ecCfgCap;
+    for (int s = 0; s < cap; s++) ec_grow(ecStartIdx[s]);
+    return ecBestGain;
+}
+
 void local_search(double beginTime)
 {
     int ts_depth   = 300;   // 连续无改进迭代数达到此值则结束本阶段
@@ -769,12 +967,14 @@ void local_search(double beginTime)
 
     while (nonImprove < ts_depth)
     {
+        g_lsIters++;
         if (((double)clock() - beginTime) / CLOCKS_PER_SEC > maxRunTime)
             break;
 
         int bestDelta = MININT_MOVE;     // 允许 0 / 负收益移动（禁忌搜索）
         int numBest   = 0;               // 与 bestDelta 持平的候选数量
         int kind = 0, a = -1, bb = -1, cc = -1;
+        int useChain = 0;                // 本迭代是否采用喷射链（复合移动）
 
         // ---- 重建 CSR 桶：按波束分组已服务任务（计数排序）----
         for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
@@ -942,7 +1142,20 @@ void local_search(double beginTime)
         //     real-real ：b1 上 i 与 b2 上 k 互换波束。
         //     所有 kind=5 移动的 delta=0，故仅当尚无严格改进移动时才探索。
         //----------------------------------------------------------------
-        if (bestDelta <= 0)
+        if (bestDelta <= 0 && !g_ecOff && (g_lsIters % ecCfgEvery == 0))
+        {
+            // ---- 喷射链：简单邻域无严格改进时的深化武器，优先于 kind5 平台搬运 ----
+            g_ecCalls++;
+            int chainGain = ec_search();
+            if (chainGain > 0)
+            {
+                useChain  = 1;
+                bestDelta = chainGain;
+                numBest   = 1;
+            }
+        }
+
+        if (bestDelta <= 0 && !useChain)
         {
             rebuild_insert_filter();
 
@@ -1051,8 +1264,25 @@ void local_search(double beginTime)
 
         // ---- 本迭代无可行非禁忌候选：本段已无路可走，结束本段交给扰动 ----
         // （解不变则下次扫描结果相同，空转无意义；持久禁忌下此情形会随表变满更常见）
-        if (numBest == 0)
+        if (numBest == 0 && !useChain)
             break;
+
+        if (useChain)                             // 提交喷射链（复合移动）
+        {
+            g_ecCommits++;
+            for (int q = 0; q < ecBestOpCount; q++)
+            {
+                if (ecBestOpBeam[q] < 0) remove_task(ecBestOpTask[q]);
+                else                     add_task(ecBestOpTask[q], ecBestOpBeam[q]);
+                moveFreq[ecBestOpTask[q]]++;
+            }
+            Hx1 += ecBestDH1; Hx2 += ecBestDH2; Hx3 += ecBestDH3;
+
+            mark_current();
+            if (totalProfit > bestProfit) { save_best(beginTime); nonImprove = 0; }
+            else                            nonImprove++;
+            continue;
+        }
 
         // 基于解禁忌：用提交前状态增量更新 Hx（替代提交后全量 compute_hash）
         update_hash_for_move(kind, a, bb, cc);
@@ -1356,6 +1586,7 @@ void ils()
         for (int j = 0; j < numTask; j++) moveFreq[j] = 0;
 
         save_best(beginTime);          // 本阶段最优从当前解出发
+        g_phases++;
         local_search(beginTime);
 
         if (bestProfit > globalProfit)
@@ -1520,6 +1751,16 @@ void free_memory()
     delete[] hashTab1;
     delete[] hashTab2;
     delete[] hashTab3;
+
+    delete[] ecWRemBW;
+    delete[] ecWRemPW;
+    delete[] ecUsedStamp;
+    delete[] ecOpTask;
+    delete[] ecOpBeam;
+    delete[] ecBestOpTask;
+    delete[] ecBestOpBeam;
+    delete[] ecStartIdx;
+    delete[] ecStartVal;
 }
 
 //====================================================================
@@ -1535,6 +1776,11 @@ int main(int argc, char **argv)
     instanceName = argv[1];
     seed         = atoi(argv[2]);
     srand(seed);
+
+    { const char *e = getenv("EC_OFF");   if (e) g_ecOff = atoi(e); }
+    { const char *e = getenv("EC_LEN");   if (e && atoi(e) > 0) ecCfgLen   = atoi(e); }
+    { const char *e = getenv("EC_CAP");   if (e && atoi(e) > 0) ecCfgCap   = atoi(e); }
+    { const char *e = getenv("EC_EVERY"); if (e && atoi(e) > 0) ecCfgEvery = atoi(e); }
 
     maxRunTime = 600.0;          // 默认时间上限（秒）
     if (argc >= 4) maxRunTime = atof(argv[3]);
@@ -1552,6 +1798,14 @@ int main(int argc, char **argv)
     cout << "ILS done.  bestProfit=" << globalProfit
          << "  bestTime=" << globalBestTime << " s" << endl;
     cout << "Elapsed time: " << elapsed << " s" << endl;
+
+    // ---- 诊断输出（EC_DIAG=1 时开启，默认静默）----
+    { const char *e = getenv("EC_DIAG");
+      if (e && atoi(e) != 0)
+        fprintf(stderr,
+            "[DIAG] ecOff=%d len=%d cap=%d every=%d | phases=%lld lsIters=%lld ecCalls=%lld ecCommits=%lld ecSteps=%lld\n",
+            g_ecOff, ecCfgLen, ecCfgCap, ecCfgEvery,
+            g_phases, g_lsIters, g_ecCalls, g_ecCommits, g_ecSteps); }
 
     free_memory();
     return 0;
