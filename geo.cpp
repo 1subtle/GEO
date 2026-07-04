@@ -90,12 +90,20 @@ long long g_flipApplyToMode[16] = {0}; // committed flips counted by target mode
 // ---- mixed feasible/infeasible search state -----------------------
 double mixedPhiBW = 1000.0;   // penalty weight for normalized BW overflow
 double mixedPhiPW = 1000.0;   // penalty weight for normalized PW overflow
+double mixedRhoBW = 0.15;     // current BW overflow radius for mixed search
+double mixedRhoPW = 0.20;     // current PW overflow radius for mixed search
+double mixedRhoMinBW = 0.05, mixedRhoMaxBW = 0.30;
+double mixedRhoMinPW = 0.08, mixedRhoMaxPW = 0.30;
 long long g_mixedIters = 0;   // total mixed-search iterations
 long long g_mixedMoves = 0;   // committed mixed-search moves
 long long g_mixedFeas  = 0;   // iterations whose current solution is feasible
 long long g_mixedInfeas = 0;  // iterations whose current solution is infeasible
 long long g_mixedBestUpdate = 0; // feasible best updates found in mixed search
+long long g_mixedRhoExpand = 0;  // adaptive relaxation expansions
+long long g_mixedRhoShrink = 0;  // adaptive relaxation contractions
 double g_mixedMaxOver = 0.0;  // largest normalized total overflow visited
+double g_mixedMaxRhoBW = 0.0; // largest BW relaxation radius used
+double g_mixedMaxRhoPW = 0.0; // largest PW relaxation radius used
 double g_mixedTime = 0.0;     // cumulative CPU seconds spent inside mixed search
 
 static char g_line[MAXLINE];
@@ -498,23 +506,97 @@ void total_over_parts(double &bwOver, double &pwOver)
     }
 }
 
+double clamp_double(double x, double lo, double hi)
+{
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+double current_resource_tightness()
+{
+    double usedBW = 0.0, capBW = 0.0;
+    double usedPW = 0.0, capPW = 0.0;
+
+    for (int b = 0; b < numBeam; b++)
+    {
+        if (beamMode[b] < 0) continue;
+
+        capBW  += beamBWCap[b];
+        usedBW += beamBWCap[b] - remBW[b];
+
+        int pwCap = beamPWCap[b] - modeBasePower[beamMode[b]];
+        if (pwCap < 1) pwCap = 1;
+        capPW  += pwCap;
+        usedPW += pwCap - remPW[b];
+    }
+
+    double bwTight = capBW > 0.0 ? usedBW / capBW : 0.0;
+    double pwTight = capPW > 0.0 ? usedPW / capPW : 0.0;
+    return bwTight > pwTight ? bwTight : pwTight;
+}
+
+void set_mixed_rho_from_instance()
+{
+    double density = numBeam > 0 ? (double)numTask / numBeam : 0.0;
+    double densityAdj = (density - 10.0) * 0.004;
+    densityAdj = clamp_double(densityAdj, 0.0, 0.08);
+
+    double tightness = current_resource_tightness();
+    double tightAdj = 0.0;
+    if (tightness > 0.92)      tightAdj = 0.03;
+    else if (tightness > 0.85) tightAdj = 0.015;
+    else if (tightness < 0.70) tightAdj = -0.02;
+
+    double targetBW = clamp_double(0.12 + densityAdj + tightAdj,
+                                   mixedRhoMinBW, mixedRhoMaxBW);
+    double targetPW = clamp_double(targetBW + 0.04,
+                                   mixedRhoMinPW, mixedRhoMaxPW);
+
+    if (mixedRhoBW < targetBW) mixedRhoBW = targetBW;
+    if (mixedRhoPW < targetPW) mixedRhoPW = targetPW;
+    if (mixedRhoBW > g_mixedMaxRhoBW) g_mixedMaxRhoBW = mixedRhoBW;
+    if (mixedRhoPW > g_mixedMaxRhoPW) g_mixedMaxRhoPW = mixedRhoPW;
+}
+
+void expand_mixed_rho()
+{
+    double oldBW = mixedRhoBW;
+    double oldPW = mixedRhoPW;
+    mixedRhoBW = clamp_double(mixedRhoBW * 1.10 + 0.01,
+                              mixedRhoMinBW, mixedRhoMaxBW);
+    mixedRhoPW = clamp_double(mixedRhoPW * 1.10 + 0.01,
+                              mixedRhoMinPW, mixedRhoMaxPW);
+    if (mixedRhoBW > g_mixedMaxRhoBW) g_mixedMaxRhoBW = mixedRhoBW;
+    if (mixedRhoPW > g_mixedMaxRhoPW) g_mixedMaxRhoPW = mixedRhoPW;
+    if (mixedRhoBW != oldBW || mixedRhoPW != oldPW) g_mixedRhoExpand++;
+}
+
+void shrink_mixed_rho()
+{
+    double oldBW = mixedRhoBW;
+    double oldPW = mixedRhoPW;
+    mixedRhoBW = clamp_double(mixedRhoBW * 0.85,
+                              mixedRhoMinBW, mixedRhoMaxBW);
+    mixedRhoPW = clamp_double(mixedRhoPW * 0.85,
+                              mixedRhoMinPW, mixedRhoMaxPW);
+    if (mixedRhoBW != oldBW || mixedRhoPW != oldPW) g_mixedRhoShrink++;
+}
+
 int relaxed_rem_ok_mode(int b, int m, int bwFree, int pwFree)
 {
-    const double rhoBW = 0.08;
-    const double rhoPW = 0.12;
-
     if (bwFree < 0)
     {
         int denom = beamBWCap[b];
         if (denom < 1) denom = 1;
-        if ((double)(-bwFree) / denom > rhoBW) return 0;
+        if ((double)(-bwFree) / denom > mixedRhoBW) return 0;
     }
 
     if (pwFree < 0)
     {
         int denom = beamPWCap[b] - modeBasePower[m];
         if (denom < 1) denom = 1;
-        if ((double)(-pwFree) / denom > rhoPW) return 0;
+        if ((double)(-pwFree) / denom > mixedRhoPW) return 0;
     }
 
     return 1;
@@ -1138,6 +1220,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
     double curOverBW, curOverPW;
     total_over_parts(curOverBW, curOverPW);
     double curOver = curOverBW + curOverPW;
+    set_mixed_rho_from_instance();
 
     for (int j = 0; j < numTask; j++) tabuUntil[j] = 0;
     for (int b = 0; b < numBeam; b++) tabuBeamMode[b] = 0;
@@ -1457,6 +1540,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
         if (numBest == 0)
         {
             nonImprove++;
+            if (nonImprove > 0 && nonImprove % 50 == 0)
+                expand_mixed_rho();
             tabuIter++;
             continue;
         }
@@ -1535,11 +1620,16 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
         if (curOver <= EPS && totalProfit > bestProfit)
         {
             save_best(beginTime);
+            shrink_mixed_rho();
             g_mixedBestUpdate++;
             nonImprove = 0;
         }
         else
+        {
             nonImprove++;
+            if (nonImprove > 0 && nonImprove % 50 == 0)
+                expand_mixed_rho();
+        }
 
         tabuIter++;
     }
@@ -1868,6 +1958,12 @@ void ils()
          << "  max_over=" << g_mixedMaxOver
          << "  final_phi_bw=" << mixedPhiBW
          << "  final_phi_pw=" << mixedPhiPW << endl;
+    cout << "[PROFILE] mixed_rho final_bw=" << mixedRhoBW
+         << " final_pw=" << mixedRhoPW
+         << " max_bw=" << g_mixedMaxRhoBW
+         << " max_pw=" << g_mixedMaxRhoPW
+         << " expands=" << g_mixedRhoExpand
+         << " shrinks=" << g_mixedRhoShrink << endl;
     cout << "[PROFILE] move_applied:"
          << " insert=" << g_applyInsert
          << " remove=" << g_applyRemove
