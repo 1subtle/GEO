@@ -54,7 +54,6 @@ int *moveFreq;       // moveFreq[j]  : how often task j has been moved (for pert
 int *tabuUntil;      // tabuUntil[j] : iteration index until which task j is tabu
 int  tabuIter;       // iteration counter within one tabu local search call
 
-// ---- mode-flip neighbourhood (kind=4) state ----
 int  *tabuBeamMode;  // tabuBeamMode[b]: iteration until which beam b's mode is tabu
 int **typeProfitSum; // typeProfitSum[b][t]: sum of profit of served tasks of type t on beam b
 
@@ -62,6 +61,8 @@ int **typeProfitSum; // typeProfitSum[b][t]: sum of profit of served tasks of ty
 // iteration so the swap neighbourhood can skip unrelated tasks.
 int *bucketTask;     // [numTask]   : served task ids, contiguous per beam
 int *bucketStart;    // [numBeam+1] : bucketStart[b]..bucketStart[b+1] = beam b's slice
+int **insertMinPW;   // insertMinPW[m][bw]: min PW of an unserved task compatible with mode m
+int  maxBeamBWCap;
 
 // ---- profiling counters (accumulated over the whole run) ----
 long long g_lsIters   = 0;   // total local_search inner iterations
@@ -71,15 +72,30 @@ long long g_tabuBlock = 0;   // candidate (task) skips due to tabu (no aspiratio
 long long g_aspire    = 0;   // tabu moves admitted via aspiration
 double    g_lsTime    = 0.0; // cumulative CPU seconds spent inside local_search
 double    g_perturbTime = 0.0; // cumulative CPU seconds spent inside perturb
-long long g_moveApplied[6] = {0}; // applied moves by kind: 1..5
-
-// ---- mode-flip (kind=4) profiling ----
-long long g_flipCand   = 0;  // (beam,mode2) pairs evaluated for mode-flip
-long long g_flipApplied = 0; // kind=4 moves committed
+long long g_applyInsert = 0; // committed insert moves
+long long g_applyRemove = 0; // committed remove-only moves
+long long g_applySwap   = 0; // committed swap moves
+long long g_applyFlip   = 0; // committed mode-flip moves
+long long g_applyCross  = 0; // committed cross-beam exchange moves
+long long g_crossCand   = 0; // feasible cross-beam exchange candidates
+long long g_crossRelocCand = 0; // kind=5 real-dummy candidates
+long long g_crossSwapCand  = 0; // kind=5 real-real candidates
+long long g_crossFiltered  = 0; // feasible kind=5 moves rejected by open-slot filter
+long long g_crossRelocApplied = 0; // committed real-dummy moves
+long long g_crossSwapApplied  = 0; // committed real-real moves
+long long g_flipCand    = 0; // feasible mode-flip candidates evaluated
+long long g_flipApplied = 0; // committed mode-flip moves
 long long g_flipApplyToMode[16] = {0}; // committed flips counted by target mode index
-long long g_ejectCand   = 0; // kind=5 eject-insert candidates
-long long g_ejectApplied = 0; // kind=5 moves committed
 
+// ---- mixed feasible/infeasible search state -----------------------
+double mixedPhi = 1000.0;     // penalty weight in eval = profit - phi * over
+long long g_mixedIters = 0;   // total mixed-search iterations
+long long g_mixedMoves = 0;   // committed mixed-search moves
+long long g_mixedFeas  = 0;   // iterations whose current solution is feasible
+long long g_mixedInfeas = 0;  // iterations whose current solution is infeasible
+long long g_mixedBestUpdate = 0; // feasible best updates found in mixed search
+double g_mixedMaxOver = 0.0;  // largest normalized total overflow visited
+double g_mixedTime = 0.0;     // cumulative CPU seconds spent inside mixed search
 
 static char g_line[MAXLINE];
 
@@ -286,7 +302,6 @@ double task_priority(int j)
     return best;
 }
 
-
 void greedy_init()
 {
     beamMode = new int[numBeam];
@@ -305,12 +320,8 @@ void greedy_init()
 
     //================================================================
     // Sequential-commit greedy (same idea as perturb's repair-modes):
-    // decide each beam's mode by trial-filling from the *current* unserved
-    // pool, then commit that fill before moving on.  Because the pool shrinks
-    // as beams commit, beams compete for scarce high-density tasks instead of
-    // each independently assuming it can grab them all — which is what made
-    // the old per-beam-independent estimate collapse every beam onto the
-    // low-base-power mode.
+    // decide each beam's mode by trial-filling from the current unserved
+    // pool, then commit that fill before moving on so beams compete for tasks.
     //================================================================
     for (int b = 0; b < numBeam; b++)
     {
@@ -387,7 +398,7 @@ void greedy_init()
 }
 
 //--------------------------------------------------------------------
-// PROBE (temporary): print beam-mode distribution + served-by-type
+// Print beam-mode distribution + served-by-type for run diagnostics.
 //--------------------------------------------------------------------
 void probe_modes(const char *tag)
 {
@@ -419,18 +430,105 @@ int feasible_on(int j, int b)
     return 1;
 }
 
-//--------------------------------------------------------------------
-// find_reloc_target: first beam, other than excludeBeam, that can receive
-// task r under the current remaining resources.
-//--------------------------------------------------------------------
-int find_reloc_target(int r, int excludeBeam)
+double beam_over_with_rem_mode(int b, int m, int bwFree, int pwFree)
 {
-    for (int b = 0; b < numBeam; b++)
+    double over = 0.0;
+
+    if (bwFree < 0)
     {
-        if (b == excludeBeam) continue;
-        if (feasible_on(r, b)) return b;
+        int denom = beamBWCap[b];
+        if (denom < 1) denom = 1;
+        over += (double)(-bwFree) / denom;
     }
-    return -1;
+
+    if (pwFree < 0)
+    {
+        int denom = beamPWCap[b] - modeBasePower[m];
+        if (denom < 1) denom = 1;
+        over += (double)(-pwFree) / denom;
+    }
+
+    return over;
+}
+
+double beam_over_with_rem(int b, int bwFree, int pwFree)
+{
+    return beam_over_with_rem_mode(b, beamMode[b], bwFree, pwFree);
+}
+
+double beam_over(int b)
+{
+    return beam_over_with_rem(b, remBW[b], remPW[b]);
+}
+
+double total_over()
+{
+    double over = 0.0;
+    for (int b = 0; b < numBeam; b++)
+        if (beamMode[b] >= 0) over += beam_over(b);
+    return over;
+}
+
+int relaxed_rem_ok_mode(int b, int m, int bwFree, int pwFree)
+{
+    const double rhoBW = 0.08;
+    const double rhoPW = 0.12;
+
+    if (bwFree < 0)
+    {
+        int denom = beamBWCap[b];
+        if (denom < 1) denom = 1;
+        if ((double)(-bwFree) / denom > rhoBW) return 0;
+    }
+
+    if (pwFree < 0)
+    {
+        int denom = beamPWCap[b] - modeBasePower[m];
+        if (denom < 1) denom = 1;
+        if ((double)(-pwFree) / denom > rhoPW) return 0;
+    }
+
+    return 1;
+}
+
+int relaxed_rem_ok(int b, int bwFree, int pwFree)
+{
+    return relaxed_rem_ok_mode(b, beamMode[b], bwFree, pwFree);
+}
+
+void rebuild_insert_filter()
+{
+    const int INF = 1000000000;
+
+    for (int m = 0; m < numMode; m++)
+        for (int w = 0; w <= maxBeamBWCap; w++)
+            insertMinPW[m][w] = INF;
+
+    for (int j = 0; j < numTask; j++)
+    {
+        if (taskBeam[j] != -1) continue;
+        int bw = taskBWDemand[j];
+        if (bw > maxBeamBWCap) continue;
+
+        int t = taskType[j] - 1;
+        for (int m = 0; m < numMode; m++)
+            if (typeCompatMode[t][m] && taskPWDemand[j] < insertMinPW[m][bw])
+                insertMinPW[m][bw] = taskPWDemand[j];
+    }
+
+    for (int m = 0; m < numMode; m++)
+        for (int w = 1; w <= maxBeamBWCap; w++)
+            if (insertMinPW[m][w - 1] < insertMinPW[m][w])
+                insertMinPW[m][w] = insertMinPW[m][w - 1];
+}
+
+int beam_can_insert_unserved_with_rem(int b, int bwFree, int pwFree)
+{
+    if (beamMode[b] < 0) return 0;
+    if (bwFree < 0 || pwFree < 0) return 0;
+    if (bwFree > maxBeamBWCap) bwFree = maxBeamBWCap;
+
+    return insertMinPW[beamMode[b]][bwFree] <= pwFree;
 }
 
 //--------------------------------------------------------------------
@@ -544,6 +642,13 @@ void alloc_search()
     bucketTask   = new int[numTask];
     bucketStart  = new int[numBeam + 1];
 
+    maxBeamBWCap = 0;
+    for (int b = 0; b < numBeam; b++)
+        if (beamBWCap[b] > maxBeamBWCap) maxBeamBWCap = beamBWCap[b];
+    insertMinPW = new int*[numMode];
+    for (int m = 0; m < numMode; m++)
+        insertMinPW[m] = new int[maxBeamBWCap + 1];
+
     tabuBeamMode = new int[numBeam];
     typeProfitSum = new int*[numBeam];
     for (int b = 0; b < numBeam; b++)
@@ -580,11 +685,41 @@ void record_candidate(int kind, int a, int b, int c, int delta,
     }
 }
 
+void record_mixed_candidate(int kind, int a, int b, int c,
+                            int deltaProfit, double deltaEval,
+                            double &bestDeltaEval, int &bestDeltaProfit,
+                            int &numBest,
+                            int &chosenKind, int &chosenA,
+                            int &chosenB, int &chosenC)
+{
+    if (deltaEval < bestDeltaEval) return;
+
+    if (deltaEval > bestDeltaEval)
+    {
+        bestDeltaEval  = deltaEval;
+        bestDeltaProfit = deltaProfit;
+        numBest = 1;
+        chosenKind = kind;
+        chosenA    = a;
+        chosenB    = b;
+        chosenC    = c;
+        return;
+    }
+
+    numBest++;
+    if (rand() % numBest == 0)
+    {
+        bestDeltaProfit = deltaProfit;
+        chosenKind = kind;
+        chosenA    = a;
+        chosenB    = b;
+        chosenC    = c;
+    }
+}
+
 //--------------------------------------------------------------------
-// apply_mode_flip: commit a pure mode switch of beam b to mode m2 — evict
-// only the served tasks whose type is incompatible with m2, switch the base
-// power, and stop.  No refill: the freed capacity is left for subsequent
-// insert/swap moves.  Matches the candidate block's delta = -eviction_loss.
+// apply_mode_flip: switch beam b to mode m2 and evict only tasks whose
+// types are incompatible with the new mode.  No refill is performed here.
 //--------------------------------------------------------------------
 void apply_mode_flip(int b, int m2, int tenure)
 {
@@ -603,17 +738,17 @@ void apply_mode_flip(int b, int m2, int tenure)
 
     beamMode[b] = m2;
     remPW[b] += modeBasePower[saveMode] - modeBasePower[m2];
-    // (remPW >= 0 guaranteed by the power check that admitted this move)
 }
 
 //--------------------------------------------------------------------
 void local_search(double beginTime, int *tmpIdx, double *tmpVal)
 {
+    (void)tmpIdx;
+    (void)tmpVal;
+
     int ts_depth = 300;              // non-improving iterations before a phase ends (triggers perturb)
     int nonImprove = 0;
     double lsStart = (double)clock();
-    (void)tmpIdx;
-    (void)tmpVal;
 
     for (int j = 0; j < numTask; j++) tabuUntil[j] = 0;
     for (int b = 0; b < numBeam; b++) tabuBeamMode[b] = 0;
@@ -650,8 +785,15 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         for (int j = 0; j < numTask; j++)
         {
             if (taskBeam[j] != -1) continue;
-            if (tabuIter < tabuUntil[j]) { g_tabuBlock++; continue; }   // tabu: skip, no aspiration
             int delta = taskProfit[j];
+            // Aspiration: a tabu insert is admitted only if it would push the
+            // current solution past the phase-best profit.
+            int jTabu = (tabuIter < tabuUntil[j]);
+            if (jTabu)
+            {
+                if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
+                else { g_tabuBlock++; continue; }
+            }
             for (int b = 0; b < numBeam; b++)
             {
                 if (!feasible_on(j, b)) continue;
@@ -665,8 +807,12 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         for (int j = 0; j < numTask; j++)
         {
             if (taskBeam[j] < 0) continue;
-            if (tabuIter < tabuUntil[j]) { g_tabuBlock++; continue; }   // tabu: skip, no aspiration
             int delta = -taskProfit[j];
+            if (tabuIter < tabuUntil[j])
+            {
+                if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
+                else { g_tabuBlock++; continue; }
+            }
             if (delta < bestDelta) continue;
 
             record_candidate(2, j, -1, -1, delta,
@@ -680,7 +826,7 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         for (int i = 0; i < numTask; i++)
         {
             if (taskBeam[i] != -1) continue;
-            if (tabuIter < tabuUntil[i]) { g_tabuBlock++; continue; }   // tabu i: skip its whole beam x k scan
+            int iTabu = (tabuIter < tabuUntil[i]);
             int ti = taskType[i] - 1;
             for (int b = 0; b < numBeam; b++)
             {
@@ -692,10 +838,17 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
                 for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
                 {
                     int k = bucketTask[idx];
-                    if (tabuIter < tabuUntil[k]) continue;   // tabu k: skip this pair
 
                     int delta = taskProfit[i] - taskProfit[k];
                     if (delta < bestDelta) continue;
+
+                    // Aspiration: a swap whose i or k is tabu is admitted only
+                    // if it would beat the phase-best profit.
+                    if (iTabu || tabuIter < tabuUntil[k])
+                    {
+                        if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
+                        else continue;
+                    }
 
                     // feasibility after removing k, adding i (same beam b)
                     int bwFree = bwFree0 + taskBWDemand[k];
@@ -708,79 +861,22 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             }
         }
 
-        // (5) eject-insert: serve a stuck unserved task u on beam b by
-        //     moving one resident task r from b to another feasible beam b'.
-        //     The only profit change is adding u, so delta = profit[u].
-        for (int u = 0; u < numTask; u++)
-        {
-            if (taskBeam[u] != -1) continue;
-            if (tabuIter < tabuUntil[u]) { g_tabuBlock++; continue; }
-
-            int delta = taskProfit[u];
-            if (delta < bestDelta) continue;
-
-            int tu = taskType[u] - 1;
-            int directInsert = 0;
-            for (int b = 0; b < numBeam; b++)
-            {
-                if (feasible_on(u, b)) { directInsert = 1; break; }
-            }
-            if (directInsert) continue;
-
-            int found = 0;
-            for (int b = 0; b < numBeam && !found; b++)
-            {
-                if (beamMode[b] < 0) continue;
-                if (!typeCompatMode[tu][beamMode[b]]) continue;
-
-                int needBW = taskBWDemand[u] - remBW[b];
-                int needPW = taskPWDemand[u] - remPW[b];
-                if (needBW <= 0 && needPW <= 0) continue;
-                if (needBW < 0) needBW = 0;
-                if (needPW < 0) needPW = 0;
-
-                for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
-                {
-                    int r = bucketTask[idx];
-                    if (tabuIter < tabuUntil[r]) continue;
-                    if (taskBWDemand[r] < needBW) continue;
-                    if (taskPWDemand[r] < needPW) continue;
-                    if (find_reloc_target(r, b) < 0) continue;
-
-                    g_ejectCand++;
-                    record_candidate(5, u, b, r, delta,
-                                     bestDelta, numBest, kind, a, bb, cc);
-                    found = 1;
-                    break;
-                }
-            }
-        }
-
-        // (4) mode-flip: switch beam b's mode, evicting ONLY the served tasks
-        //     whose type is incompatible with the new mode.  No refill here:
-        //     the freed room is left for later insert/swap moves to fill, so
-        //     the move's delta is exactly the eviction loss (<= 0).  This keeps
-        //     a flip honest about its real local cost (it no longer looks like
-        //     a gain by greedily refilling) and lets insert/swap compete for
-        //     the freed capacity on equal footing.
+        // (4) mode-flip: switch one beam's mode, evicting only tasks
+        //     incompatible with the new mode.  No refill is evaluated here.
         for (int b = 0; b < numBeam; b++)
         {
             if (beamMode[b] < 0) continue;
-            if (tabuIter < tabuBeamMode[b]) continue;   // beam mode tabu: skip whole beam
-            int usedPW_b = (beamPWCap[b] - modeBasePower[beamMode[b]]) - remPW[b];
+
+            int usedPW = (beamPWCap[b] - modeBasePower[beamMode[b]]) - remPW[b];
             for (int m2 = 0; m2 < numMode; m2++)
             {
                 if (m2 == beamMode[b]) continue;
-                if (modeBasePower[m2] > beamPWCap[b]) continue;  // mode power-infeasible
+                if (modeBasePower[m2] > beamPWCap[b]) continue;
 
-                // eviction loss (profit) of types incompatible with m2
                 int loss = 0;
                 for (int t = 0; t < numType; t++)
                     if (!typeCompatMode[t][m2]) loss += typeProfitSum[b][t];
 
-                // evicted power: kept tasks must still fit m2's power budget;
-                // if any task being evicted is itself tabu, skip this m2 so a
-                // mode flip cannot quietly move a recently-touched task.
                 int evictPW = 0;
                 int evictTabu = 0;
                 for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
@@ -789,18 +885,114 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
                     if (taskBeam[j] == b && !typeCompatMode[taskType[j] - 1][m2])
                     {
                         evictPW += taskPWDemand[j];
-                        if (tabuIter < tabuUntil[j]) { evictTabu = 1; break; }
+                        if (tabuIter < tabuUntil[j]) evictTabu = 1;
                     }
                 }
-                if (evictTabu) continue;                          // evicts a tabu task: skip
-                if (usedPW_b - evictPW > beamPWCap[b] - modeBasePower[m2]) continue;
+                if (usedPW - evictPW > beamPWCap[b] - modeBasePower[m2]) continue;
 
-                int delta = -loss;                 // pure switch: exact, always <= 0
+                int delta = -loss;
+                int tabuFlip = (tabuIter < tabuBeamMode[b]) || evictTabu;
+                if (tabuFlip)
+                {
+                    if (totalProfit + delta > bestProfit) { /* aspiration: admit */ }
+                    else { g_tabuBlock++; continue; }
+                }
+
                 g_flipCand++;
                 if (delta < bestDelta) continue;
-
                 record_candidate(4, b, m2, -1, delta,
                                  bestDelta, numBest, kind, a, bb, cc);
+            }
+        }
+
+        // (5) cross-beam exchange with a dynamic dummy slot --------------
+        //     real-real:  served i on b1 swaps beam with served k on b2.
+        //     real-dummy: served i on b1 relocates to b2; cc == -1 records
+        //     the temporary dummy(b2).  Dummy is not stored in taskBeam[].
+        //     Since every kind=5 move has delta=0, skip this neighbourhood
+        //     when a strictly improving move is already available.
+        if (bestDelta <= 0)
+        {
+            rebuild_insert_filter();
+
+            for (int i = 0; i < numTask; i++)
+            {
+                int b1 = taskBeam[i];
+                if (b1 < 0) continue;
+
+                int iTabu = (tabuIter < tabuUntil[i]);
+                if (iTabu)
+                {
+                    if (totalProfit > bestProfit) { /* aspiration: admit */ }
+                    else { g_tabuBlock++; continue; }
+                }
+
+                int ti = taskType[i] - 1;
+                for (int b2 = 0; b2 < numBeam; b2++)
+                {
+                    if (b2 == b1) continue;
+                    if (beamMode[b2] < 0) continue;
+                    if (!typeCompatMode[ti][beamMode[b2]]) continue;
+
+                    int delta = 0;
+
+                    // real-dummy: move i from b1 to the current free slot on b2.
+                    if (taskBWDemand[i] <= remBW[b2] &&
+                        taskPWDemand[i] <= remPW[b2])
+                    {
+                        if (!beam_can_insert_unserved_with_rem(
+                                b1,
+                                remBW[b1] + taskBWDemand[i],
+                                remPW[b1] + taskPWDemand[i]))
+                        {
+                            g_crossFiltered++;
+                        }
+                        else
+                        {
+                            g_crossCand++;
+                            g_crossRelocCand++;
+                            record_candidate(5, i, b2, -1, delta,
+                                             bestDelta, numBest, kind, a, bb, cc);
+                        }
+                    }
+
+                    // real-real: enumerate each cross-beam pair once.
+                    if (b1 > b2) continue;
+
+                    for (int idx = bucketStart[b2]; idx < bucketStart[b2 + 1]; idx++)
+                    {
+                        int k = bucketTask[idx];
+                        int tk = taskType[k] - 1;
+
+                        if (!typeCompatMode[tk][beamMode[b1]]) continue;
+                        if (taskBWDemand[k] > remBW[b1] + taskBWDemand[i]) continue;
+                        if (taskPWDemand[k] > remPW[b1] + taskPWDemand[i]) continue;
+                        if (taskBWDemand[i] > remBW[b2] + taskBWDemand[k]) continue;
+                        if (taskPWDemand[i] > remPW[b2] + taskPWDemand[k]) continue;
+
+                        if (tabuIter < tabuUntil[k])
+                        {
+                            if (totalProfit > bestProfit) { /* aspiration: admit */ }
+                            else { g_tabuBlock++; continue; }
+                        }
+
+                        int b1BW = remBW[b1] + taskBWDemand[i] - taskBWDemand[k];
+                        int b1PW = remPW[b1] + taskPWDemand[i] - taskPWDemand[k];
+                        int b2BW = remBW[b2] + taskBWDemand[k] - taskBWDemand[i];
+                        int b2PW = remPW[b2] + taskPWDemand[k] - taskPWDemand[i];
+                        if (!beam_can_insert_unserved_with_rem(b1, b1BW, b1PW) &&
+                            !beam_can_insert_unserved_with_rem(b2, b2BW, b2PW))
+                        {
+                            g_crossFiltered++;
+                            continue;
+                        }
+
+                        g_crossCand++;
+                        g_crossSwapCand++;
+                        record_candidate(5, i, b2, k, delta,
+                                         bestDelta, numBest, kind, a, bb, cc);
+                    }
+                }
             }
         }
 
@@ -813,58 +1005,72 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             continue;
         }
         g_lsMoves++;
-
-        // one tenure per move: every task/beam this move touches is frozen for
-        // the SAME number of iterations, so a move can never be partially undone
-        // by one endpoint un-tabuing before the other (which would invite short
-        // cycles).  Draw the random tenure once here, not per touched element.
-        int tenure = tabu_tenure();
+        // count an aspiration whenever the committed move broke a task/beam tabu
+        if ((kind == 1 && tabuIter < tabuUntil[a]) ||
+            (kind == 2 && tabuIter < tabuUntil[a]) ||
+            (kind == 3 && (tabuIter < tabuUntil[a] || tabuIter < tabuUntil[cc])) ||
+            (kind == 4 && tabuIter < tabuBeamMode[a]) ||
+            (kind == 5 && (tabuIter < tabuUntil[a] ||
+                           (cc >= 0 && tabuIter < tabuUntil[cc]))))
+            g_aspire++;
 
         if (kind == 1)                            // insert
         {
             add_task(a, bb);
             moveFreq[a]++;
-            tabuUntil[a] = tabuIter + tenure;
+            tabuUntil[a] = tabuIter + tabu_tenure();
+            g_applyInsert++;
         }
         else if (kind == 2)                       // remove-only
         {
             remove_task(a);
             moveFreq[a]++;
-            tabuUntil[a] = tabuIter + tenure;
+            tabuUntil[a] = tabuIter + tabu_tenure();
+            g_applyRemove++;
         }
         else if (kind == 3)                       // swap a in, cc out
         {
             remove_task(cc);
             add_task(a, bb);
             moveFreq[a]++; moveFreq[cc]++;
-            tabuUntil[a]  = tabuIter + tenure;
-            tabuUntil[cc] = tabuIter + tenure;
+            tabuUntil[a]  = tabuIter + tabu_tenure();
+            tabuUntil[cc] = tabuIter + tabu_tenure();
+            g_applySwap++;
         }
         else if (kind == 4)                       // mode-flip beam a to mode bb
         {
+            int tenure = tabu_tenure();
             apply_mode_flip(a, bb, tenure);
             tabuBeamMode[a] = tabuIter + tenure;
+            g_applyFlip++;
             g_flipApplied++;
             if (bb >= 0 && bb < 16) g_flipApplyToMode[bb]++;
         }
-        else if (kind == 5)                       // eject-insert: a into bb, cc relocates out
+        else if (kind == 5)                       // cross-beam exchange with dummy
         {
-            int b2 = find_reloc_target(cc, bb);
-            if (b2 < 0)
+            int b1 = taskBeam[a];
+            if (cc < 0)                           // real-dummy: relocate a to bb
             {
-                cout << "ERROR: eject-insert lost relocation target" << endl;
-                exit(1);
+                remove_task(a);
+                add_task(a, bb);
+                moveFreq[a]++;
+                tabuUntil[a] = tabuIter + tabu_tenure();
+                g_crossRelocApplied++;
             }
-            remove_task(cc);
-            add_task(a, bb);
-            add_task(cc, b2);
-            moveFreq[a]++; moveFreq[cc]++;
-            tabuUntil[a]  = tabuIter + tenure;
-            tabuUntil[cc] = tabuIter + tenure;
-            g_ejectApplied++;
+            else                                  // real-real: swap a and cc
+            {
+                int b2 = taskBeam[cc];
+                remove_task(a);
+                remove_task(cc);
+                add_task(a, b2);
+                add_task(cc, b1);
+                moveFreq[a]++; moveFreq[cc]++;
+                tabuUntil[a]  = tabuIter + tabu_tenure();
+                tabuUntil[cc] = tabuIter + tabu_tenure();
+                g_crossSwapApplied++;
+            }
+            g_applyCross++;
         }
-        if (kind >= 1 && kind <= 5) g_moveApplied[kind]++;
-
         if (totalProfit > bestProfit)
         {
             save_best(beginTime);
@@ -876,6 +1082,380 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         tabuIter++;
     }
     g_lsTime += ((double)clock() - lsStart) / CLOCKS_PER_SEC;
+}
+
+//--------------------------------------------------------------------
+// local_search_mixed: feasible + infeasible tabu search.
+// BW/PW capacity constraints are relaxed within a small boundary.  Mode
+// compatibility and one-beam-per-task remain hard constraints.  The current
+// solution may be infeasible, but only feasible solutions update bestProfit.
+//--------------------------------------------------------------------
+void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
+{
+    (void)tmpIdx;
+    (void)tmpVal;
+
+    const double EPS = 1e-12;
+    const int mixedDepth = 300;
+    const int phiWindow = 5;
+    const double phiTau = 2.0;
+    const double phiMin = 100.0;
+    const double phiMax = 100000.0;
+
+    int nonImprove = 0;
+    int feasibleStreak = 0;
+    int infeasibleStreak = 0;
+    double mixedStart = (double)clock();
+    double curOver = total_over();
+
+    for (int j = 0; j < numTask; j++) tabuUntil[j] = 0;
+    for (int b = 0; b < numBeam; b++) tabuBeamMode[b] = 0;
+    tabuIter = 0;
+
+    while (nonImprove < mixedDepth)
+    {
+        g_mixedIters++;
+        if (((double)clock() - beginTime) / CLOCKS_PER_SEC > maxRunTime)
+            break;
+
+        if (curOver <= EPS)
+        {
+            g_mixedFeas++;
+            feasibleStreak++;
+            infeasibleStreak = 0;
+            if (feasibleStreak >= phiWindow)
+            {
+                mixedPhi /= phiTau;
+                if (mixedPhi < phiMin) mixedPhi = phiMin;
+                feasibleStreak = 0;
+            }
+        }
+        else
+        {
+            g_mixedInfeas++;
+            infeasibleStreak++;
+            feasibleStreak = 0;
+            if (infeasibleStreak >= phiWindow)
+            {
+                mixedPhi *= phiTau;
+                if (mixedPhi > phiMax) mixedPhi = phiMax;
+                infeasibleStreak = 0;
+            }
+        }
+
+        double bestDeltaEval = -1.0e100;
+        int bestDeltaProfit = MININT_MOVE;
+        int numBest = 0;
+        int kind = 0, a = -1, bb = -1, cc = -1;
+
+        for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
+        for (int j = 0; j < numTask; j++)
+            if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
+        for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
+        for (int j = 0; j < numTask; j++)
+            if (taskBeam[j] >= 0)
+            {
+                int b = taskBeam[j];
+                bucketTask[bucketStart[b]++] = j;
+            }
+        for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
+        bucketStart[0] = 0;
+
+        // (1) insert unserved task ----------------------------------
+        for (int j = 0; j < numTask; j++)
+        {
+            if (taskBeam[j] != -1) continue;
+            int deltaProfit = taskProfit[j];
+            int t = taskType[j] - 1;
+
+            for (int b = 0; b < numBeam; b++)
+            {
+                if (beamMode[b] < 0) continue;
+                if (!typeCompatMode[t][beamMode[b]]) continue;
+
+                int bw2 = remBW[b] - taskBWDemand[j];
+                int pw2 = remPW[b] - taskPWDemand[j];
+                if (!relaxed_rem_ok(b, bw2, pw2)) continue;
+
+                double newOver = curOver - beam_over(b) + beam_over_with_rem(b, bw2, pw2);
+                if (tabuIter < tabuUntil[j])
+                {
+                    if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* aspiration */ }
+                    else { g_tabuBlock++; continue; }
+                }
+
+                double deltaEval = (double)deltaProfit - mixedPhi * (newOver - curOver);
+                record_mixed_candidate(1, j, b, -1, deltaProfit, deltaEval,
+                                       bestDeltaEval, bestDeltaProfit, numBest,
+                                       kind, a, bb, cc);
+            }
+        }
+
+        // (2) remove-only -------------------------------------------
+        for (int j = 0; j < numTask; j++)
+        {
+            int b = taskBeam[j];
+            if (b < 0) continue;
+
+            int deltaProfit = -taskProfit[j];
+            int bw2 = remBW[b] + taskBWDemand[j];
+            int pw2 = remPW[b] + taskPWDemand[j];
+            double newOver = curOver - beam_over(b) + beam_over_with_rem(b, bw2, pw2);
+
+            if (tabuIter < tabuUntil[j])
+            {
+                if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* aspiration */ }
+                else { g_tabuBlock++; continue; }
+            }
+
+            double deltaEval = (double)deltaProfit - mixedPhi * (newOver - curOver);
+            record_mixed_candidate(2, j, -1, -1, deltaProfit, deltaEval,
+                                   bestDeltaEval, bestDeltaProfit, numBest,
+                                   kind, a, bb, cc);
+        }
+
+        // (3) same-beam swap ----------------------------------------
+        for (int i = 0; i < numTask; i++)
+        {
+            if (taskBeam[i] != -1) continue;
+            int ti = taskType[i] - 1;
+
+            for (int b = 0; b < numBeam; b++)
+            {
+                if (beamMode[b] < 0) continue;
+                if (!typeCompatMode[ti][beamMode[b]]) continue;
+
+                for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
+                {
+                    int k = bucketTask[idx];
+                    int deltaProfit = taskProfit[i] - taskProfit[k];
+                    int bw2 = remBW[b] + taskBWDemand[k] - taskBWDemand[i];
+                    int pw2 = remPW[b] + taskPWDemand[k] - taskPWDemand[i];
+                    if (!relaxed_rem_ok(b, bw2, pw2)) continue;
+
+                    double newOver = curOver - beam_over(b) + beam_over_with_rem(b, bw2, pw2);
+                    if (tabuIter < tabuUntil[i] || tabuIter < tabuUntil[k])
+                    {
+                        if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* aspiration */ }
+                        else { g_tabuBlock++; continue; }
+                    }
+
+                    double deltaEval = (double)deltaProfit - mixedPhi * (newOver - curOver);
+                    record_mixed_candidate(3, i, b, k, deltaProfit, deltaEval,
+                                           bestDeltaEval, bestDeltaProfit, numBest,
+                                           kind, a, bb, cc);
+                }
+            }
+        }
+
+        // (4) mode-flip ---------------------------------------------
+        for (int b = 0; b < numBeam; b++)
+        {
+            if (beamMode[b] < 0) continue;
+
+            for (int m2 = 0; m2 < numMode; m2++)
+            {
+                if (m2 == beamMode[b]) continue;
+                if (modeBasePower[m2] > beamPWCap[b]) continue;
+
+                int loss = 0, evictBW = 0, evictPW = 0, evictTabu = 0;
+                for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
+                {
+                    int j = bucketTask[idx];
+                    if (taskBeam[j] == b && !typeCompatMode[taskType[j] - 1][m2])
+                    {
+                        loss += taskProfit[j];
+                        evictBW += taskBWDemand[j];
+                        evictPW += taskPWDemand[j];
+                        if (tabuIter < tabuUntil[j]) evictTabu = 1;
+                    }
+                }
+
+                int bw2 = remBW[b] + evictBW;
+                int pw2 = remPW[b] + evictPW + modeBasePower[beamMode[b]] - modeBasePower[m2];
+                if (!relaxed_rem_ok_mode(b, m2, bw2, pw2)) continue;
+
+                int deltaProfit = -loss;
+                double newOver = curOver - beam_over(b) + beam_over_with_rem_mode(b, m2, bw2, pw2);
+                if (tabuIter < tabuBeamMode[b] || evictTabu)
+                {
+                    if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* aspiration */ }
+                    else { g_tabuBlock++; continue; }
+                }
+
+                g_flipCand++;
+                double deltaEval = (double)deltaProfit - mixedPhi * (newOver - curOver);
+                record_mixed_candidate(4, b, m2, -1, deltaProfit, deltaEval,
+                                       bestDeltaEval, bestDeltaProfit, numBest,
+                                       kind, a, bb, cc);
+            }
+        }
+
+        // (5) cross-beam exchange with a dynamic dummy slot ----------
+        for (int i = 0; i < numTask; i++)
+        {
+            int b1 = taskBeam[i];
+            if (b1 < 0) continue;
+
+            int ti = taskType[i] - 1;
+            for (int b2 = 0; b2 < numBeam; b2++)
+            {
+                if (b2 == b1) continue;
+                if (beamMode[b2] < 0) continue;
+                if (!typeCompatMode[ti][beamMode[b2]]) continue;
+
+                int b1BW = remBW[b1] + taskBWDemand[i];
+                int b1PW = remPW[b1] + taskPWDemand[i];
+                int b2BW = remBW[b2] - taskBWDemand[i];
+                int b2PW = remPW[b2] - taskPWDemand[i];
+                if (relaxed_rem_ok(b1, b1BW, b1PW) &&
+                    relaxed_rem_ok(b2, b2BW, b2PW))
+                {
+                    double newOver = curOver
+                        - beam_over(b1) - beam_over(b2)
+                        + beam_over_with_rem(b1, b1BW, b1PW)
+                        + beam_over_with_rem(b2, b2BW, b2PW);
+
+                    if (tabuIter < tabuUntil[i])
+                    {
+                        if (newOver <= EPS && totalProfit > bestProfit) { /* aspiration */ }
+                        else { g_tabuBlock++; continue; }
+                    }
+
+                    double deltaEval = -mixedPhi * (newOver - curOver);
+                    g_crossCand++;
+                    g_crossRelocCand++;
+                    record_mixed_candidate(5, i, b2, -1, 0, deltaEval,
+                                           bestDeltaEval, bestDeltaProfit, numBest,
+                                           kind, a, bb, cc);
+                }
+
+                if (b1 > b2) continue;
+                for (int idx = bucketStart[b2]; idx < bucketStart[b2 + 1]; idx++)
+                {
+                    int k = bucketTask[idx];
+                    int tk = taskType[k] - 1;
+                    if (!typeCompatMode[tk][beamMode[b1]]) continue;
+
+                    b1BW = remBW[b1] + taskBWDemand[i] - taskBWDemand[k];
+                    b1PW = remPW[b1] + taskPWDemand[i] - taskPWDemand[k];
+                    b2BW = remBW[b2] + taskBWDemand[k] - taskBWDemand[i];
+                    b2PW = remPW[b2] + taskPWDemand[k] - taskPWDemand[i];
+                    if (!relaxed_rem_ok(b1, b1BW, b1PW)) continue;
+                    if (!relaxed_rem_ok(b2, b2BW, b2PW)) continue;
+
+                    double newOver = curOver
+                        - beam_over(b1) - beam_over(b2)
+                        + beam_over_with_rem(b1, b1BW, b1PW)
+                        + beam_over_with_rem(b2, b2BW, b2PW);
+
+                    if (tabuIter < tabuUntil[i] || tabuIter < tabuUntil[k])
+                    {
+                        if (newOver <= EPS && totalProfit > bestProfit) { /* aspiration */ }
+                        else { g_tabuBlock++; continue; }
+                    }
+
+                    double deltaEval = -mixedPhi * (newOver - curOver);
+                    g_crossCand++;
+                    g_crossSwapCand++;
+                    record_mixed_candidate(5, i, b2, k, 0, deltaEval,
+                                           bestDeltaEval, bestDeltaProfit, numBest,
+                                           kind, a, bb, cc);
+                }
+            }
+        }
+
+        if (numBest == 0)
+        {
+            nonImprove++;
+            tabuIter++;
+            continue;
+        }
+
+        g_mixedMoves++;
+        if ((kind == 1 && tabuIter < tabuUntil[a]) ||
+            (kind == 2 && tabuIter < tabuUntil[a]) ||
+            (kind == 3 && (tabuIter < tabuUntil[a] || tabuIter < tabuUntil[cc])) ||
+            (kind == 4 && tabuIter < tabuBeamMode[a]) ||
+            (kind == 5 && (tabuIter < tabuUntil[a] ||
+                           (cc >= 0 && tabuIter < tabuUntil[cc]))))
+            g_aspire++;
+
+        if (kind == 1)
+        {
+            add_task(a, bb);
+            moveFreq[a]++;
+            tabuUntil[a] = tabuIter + tabu_tenure();
+            g_applyInsert++;
+        }
+        else if (kind == 2)
+        {
+            remove_task(a);
+            moveFreq[a]++;
+            tabuUntil[a] = tabuIter + tabu_tenure();
+            g_applyRemove++;
+        }
+        else if (kind == 3)
+        {
+            remove_task(cc);
+            add_task(a, bb);
+            moveFreq[a]++; moveFreq[cc]++;
+            tabuUntil[a]  = tabuIter + tabu_tenure();
+            tabuUntil[cc] = tabuIter + tabu_tenure();
+            g_applySwap++;
+        }
+        else if (kind == 4)
+        {
+            int tenure = tabu_tenure();
+            apply_mode_flip(a, bb, tenure);
+            tabuBeamMode[a] = tabuIter + tenure;
+            g_applyFlip++;
+            g_flipApplied++;
+            if (bb >= 0 && bb < 16) g_flipApplyToMode[bb]++;
+        }
+        else if (kind == 5)
+        {
+            int b1 = taskBeam[a];
+            if (cc < 0)
+            {
+                remove_task(a);
+                add_task(a, bb);
+                moveFreq[a]++;
+                tabuUntil[a] = tabuIter + tabu_tenure();
+                g_crossRelocApplied++;
+            }
+            else
+            {
+                int b2 = taskBeam[cc];
+                remove_task(a);
+                remove_task(cc);
+                add_task(a, b2);
+                add_task(cc, b1);
+                moveFreq[a]++; moveFreq[cc]++;
+                tabuUntil[a]  = tabuIter + tabu_tenure();
+                tabuUntil[cc] = tabuIter + tabu_tenure();
+                g_crossSwapApplied++;
+            }
+            g_applyCross++;
+        }
+
+        curOver = total_over();
+        if (curOver > g_mixedMaxOver) g_mixedMaxOver = curOver;
+
+        if (curOver <= EPS && totalProfit > bestProfit)
+        {
+            save_best(beginTime);
+            g_mixedBestUpdate++;
+            nonImprove = 0;
+        }
+        else
+            nonImprove++;
+
+        tabuIter++;
+    }
+
+    restore_best();       // mixed phase always hands a feasible solution forward
+    g_mixedTime += ((double)clock() - mixedStart) / CLOCKS_PER_SEC;
 }
 
 //--------------------------------------------------------------------
@@ -916,9 +1496,9 @@ void perturb(int *tmpIdx, double *tmpVal)
 
     // per-beam frequency key = sum of moveFreq over its served tasks
     int    *perturbBeam = new int[numBeam];      // scratch: beams chosen to empty
-    int    *prevMode = new int[numBeam];         // mode each emptied beam had before destroy
+    int    *prevMode    = new int[numBeam];      // mode each emptied beam had before destroy
     double *beamFreqKey = new double[numBeam];
-    int    *order = new int[numBeam];
+    int    *order       = new int[numBeam];
     for (int b = 0; b < numBeam; b++) { beamFreqKey[b] = 0.0; order[b] = b; }
     for (int j = 0; j < numTask; j++)
         if (taskBeam[j] >= 0) beamFreqKey[taskBeam[j]] += moveFreq[j];
@@ -943,7 +1523,7 @@ void perturb(int *tmpIdx, double *tmpVal)
     for (int k = 0; k < numDestroy; k++)
     {
         int b = perturbBeam[k];
-        prevMode[k] = beamMode[b];                  // remember the old mode: must not be reselected
+        prevMode[k] = beamMode[b];                  // remember old mode; repair may choose it again
         for (int j = 0; j < numTask; j++)
             if (taskBeam[j] == b) remove_task(j);
         beamMode[b] = -1;
@@ -968,7 +1548,6 @@ void perturb(int *tmpIdx, double *tmpVal)
 
         for (int m = 0; m < numMode; m++)
         {
-            if (numMode > 1 && m == prevMode[k]) continue;       // force a real mode perturbation
             if (modeBasePower[m] > beamPWCap[b]) continue;       // power infeasible
 
             beamMode[b] = m;
@@ -977,10 +1556,10 @@ void perturb(int *tmpIdx, double *tmpVal)
 
             int nFree = 0;
             for (int j = 0; j < numTask; j++)
-                if (taskBeam[j] == -1 && typeCompatMode[taskType[j] - 1][m])
+                if (taskBeam[j] == -1)
                 {
                     tmpIdx[nFree] = j;
-                    tmpVal[nFree] = task_score(j, b, m);
+                    tmpVal[nFree] = task_priority(j);
                     nFree++;
                 }
             if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
@@ -1138,6 +1717,9 @@ void ils()
 
         save_best(beginTime);          // phase-best starts from the current solution
         local_search(beginTime, tmpIdx, tmpVal);
+        restore_best();                // mixed search starts from the best feasible point
+        local_search_mixed(beginTime, tmpIdx, tmpVal);
+        restore_best();                // perturb and global update receive a feasible solution
         numPhase++;
 
         if (numPhase == 1) probe_modes("after_LS1");
@@ -1172,7 +1754,7 @@ void ils()
     cout << "Perturbations over the whole run: " << numPhase << endl;
 
     // ---- profiling report ----
-    double totalLS = g_lsTime + g_perturbTime;
+    double totalLS = g_lsTime + g_mixedTime + g_perturbTime;
     cout << "[PROFILE] phases=" << numPhase
          << "  ls_iters=" << g_lsIters
          << "  moves=" << g_lsMoves
@@ -1182,23 +1764,31 @@ void ils()
          << "  stall_rate=" << (g_lsIters ? 100.0 * g_lsStall / g_lsIters : 0) << "%" << endl;
     cout << "[PROFILE] tabu_blocks=" << g_tabuBlock
          << "  aspirations=" << g_aspire << endl;
-    cout << "[PROFILE] move_kinds:"
-         << " insert=" << g_moveApplied[1]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[1] / g_lsMoves : 0) << "%)"
-         << " remove=" << g_moveApplied[2]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[2] / g_lsMoves : 0) << "%)"
-         << " same_swap=" << g_moveApplied[3]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[3] / g_lsMoves : 0) << "%)"
-         << " mode_flip=" << g_moveApplied[4]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[4] / g_lsMoves : 0) << "%)"
-         << " eject_insert=" << g_moveApplied[5]
-         << " (" << (g_lsMoves ? 100.0 * g_moveApplied[5] / g_lsMoves : 0) << "%)"
-         << endl;
     cout << "[PROFILE] ls_time=" << g_lsTime << "s (" << (totalLS ? 100.0 * g_lsTime / totalLS : 0) << "%)"
+         << "  mixed_time=" << g_mixedTime << "s (" << (totalLS ? 100.0 * g_mixedTime / totalLS : 0) << "%)"
          << "  perturb_time=" << g_perturbTime << "s (" << (totalLS ? 100.0 * g_perturbTime / totalLS : 0) << "%)" << endl;
     cout << "[PROFILE] us_per_ls_iter=" << (g_lsIters ? 1e6 * g_lsTime / g_lsIters : 0) << endl;
-
-    // ---- mode-flip (kind=4) report ----
+    cout << "[PROFILE] mixed_iters=" << g_mixedIters
+         << "  mixed_moves=" << g_mixedMoves
+         << "  feasible=" << g_mixedFeas
+         << " (" << (g_mixedIters ? 100.0 * g_mixedFeas / g_mixedIters : 0) << "%)"
+         << "  infeasible=" << g_mixedInfeas
+         << " (" << (g_mixedIters ? 100.0 * g_mixedInfeas / g_mixedIters : 0) << "%)"
+         << "  best_updates=" << g_mixedBestUpdate
+         << "  max_over=" << g_mixedMaxOver
+         << "  final_phi=" << mixedPhi << endl;
+    cout << "[PROFILE] move_applied:"
+         << " insert=" << g_applyInsert
+         << " remove=" << g_applyRemove
+         << " swap=" << g_applySwap
+         << " flip=" << g_applyFlip
+         << " cross=" << g_applyCross << endl;
+    cout << "[PROFILE] cross_cand=" << g_crossCand
+         << " reloc_cand=" << g_crossRelocCand
+         << " swap_cand=" << g_crossSwapCand
+         << " filtered=" << g_crossFiltered
+         << " reloc_applied=" << g_crossRelocApplied
+         << " swap_applied=" << g_crossSwapApplied << endl;
     cout << "[PROFILE] flip_cand=" << g_flipCand
          << "  applied=" << g_flipApplied
          << " (" << (g_lsMoves ? 100.0 * g_flipApplied / g_lsMoves : 0) << "% of moves)" << endl;
@@ -1206,10 +1796,7 @@ void ils()
     for (int m = 0; m < numMode && m < 16; m++)
         cout << " " << modeName[m] << "=" << g_flipApplyToMode[m];
     cout << endl;
-    cout << "[PROFILE] eject_cand=" << g_ejectCand
-         << "  applied=" << g_ejectApplied
-         << " (" << (g_lsMoves ? 100.0 * g_ejectApplied / g_lsMoves : 0)
-         << "% of moves)" << endl;
+
 }
 
 //--------------------------------------------------------------------
@@ -1337,6 +1924,8 @@ void free_memory()
     delete[] tabuUntil;
     delete[] bucketTask;
     delete[] bucketStart;
+    for (int m = 0; m < numMode; m++) delete[] insertMinPW[m];
+    delete[] insertMinPW;
 
     delete[] tabuBeamMode;
     for (int b = 0; b < numBeam; b++) delete[] typeProfitSum[b];
