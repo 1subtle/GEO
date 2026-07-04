@@ -88,7 +88,8 @@ long long g_flipApplied = 0; // committed mode-flip moves
 long long g_flipApplyToMode[16] = {0}; // committed flips counted by target mode index
 
 // ---- mixed feasible/infeasible search state -----------------------
-double mixedPhi = 1000.0;     // penalty weight in eval = profit - phi * over
+double mixedPhiBW = 1000.0;   // penalty weight for normalized BW overflow
+double mixedPhiPW = 1000.0;   // penalty weight for normalized PW overflow
 long long g_mixedIters = 0;   // total mixed-search iterations
 long long g_mixedMoves = 0;   // committed mixed-search moves
 long long g_mixedFeas  = 0;   // iterations whose current solution is feasible
@@ -430,25 +431,31 @@ int feasible_on(int j, int b)
     return 1;
 }
 
+double beam_bw_over_with_rem(int b, int bwFree)
+{
+    if (bwFree >= 0) return 0.0;
+    int denom = beamBWCap[b];
+    if (denom < 1) denom = 1;
+    return (double)(-bwFree) / denom;
+}
+
+double beam_pw_over_with_rem_mode(int b, int m, int pwFree)
+{
+    if (pwFree >= 0) return 0.0;
+    int denom = beamPWCap[b] - modeBasePower[m];
+    if (denom < 1) denom = 1;
+    return (double)(-pwFree) / denom;
+}
+
+double beam_pw_over_with_rem(int b, int pwFree)
+{
+    return beam_pw_over_with_rem_mode(b, beamMode[b], pwFree);
+}
+
 double beam_over_with_rem_mode(int b, int m, int bwFree, int pwFree)
 {
-    double over = 0.0;
-
-    if (bwFree < 0)
-    {
-        int denom = beamBWCap[b];
-        if (denom < 1) denom = 1;
-        over += (double)(-bwFree) / denom;
-    }
-
-    if (pwFree < 0)
-    {
-        int denom = beamPWCap[b] - modeBasePower[m];
-        if (denom < 1) denom = 1;
-        over += (double)(-pwFree) / denom;
-    }
-
-    return over;
+    return beam_bw_over_with_rem(b, bwFree) +
+           beam_pw_over_with_rem_mode(b, m, pwFree);
 }
 
 double beam_over_with_rem(int b, int bwFree, int pwFree)
@@ -461,12 +468,34 @@ double beam_over(int b)
     return beam_over_with_rem(b, remBW[b], remPW[b]);
 }
 
+double beam_bw_over(int b)
+{
+    return beam_bw_over_with_rem(b, remBW[b]);
+}
+
+double beam_pw_over(int b)
+{
+    return beam_pw_over_with_rem(b, remPW[b]);
+}
+
 double total_over()
 {
     double over = 0.0;
     for (int b = 0; b < numBeam; b++)
         if (beamMode[b] >= 0) over += beam_over(b);
     return over;
+}
+
+void total_over_parts(double &bwOver, double &pwOver)
+{
+    bwOver = 0.0;
+    pwOver = 0.0;
+    for (int b = 0; b < numBeam; b++)
+    {
+        if (beamMode[b] < 0) continue;
+        bwOver += beam_bw_over(b);
+        pwOver += beam_pw_over(b);
+    }
 }
 
 int relaxed_rem_ok_mode(int b, int m, int bwFree, int pwFree)
@@ -1103,10 +1132,12 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
     const double phiMax = 100000.0;
 
     int nonImprove = 0;
-    int feasibleStreak = 0;
-    int infeasibleStreak = 0;
+    int bwFeasibleStreak = 0, bwInfeasibleStreak = 0;
+    int pwFeasibleStreak = 0, pwInfeasibleStreak = 0;
     double mixedStart = (double)clock();
-    double curOver = total_over();
+    double curOverBW, curOverPW;
+    total_over_parts(curOverBW, curOverPW);
+    double curOver = curOverBW + curOverPW;
 
     for (int j = 0; j < numTask; j++) tabuUntil[j] = 0;
     for (int b = 0; b < numBeam; b++) tabuBeamMode[b] = 0;
@@ -1114,32 +1145,62 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
 
     while (nonImprove < mixedDepth)
     {
-        g_mixedIters++;
         if (((double)clock() - beginTime) / CLOCKS_PER_SEC > maxRunTime)
             break;
+        g_mixedIters++;
 
         if (curOver <= EPS)
         {
             g_mixedFeas++;
-            feasibleStreak++;
-            infeasibleStreak = 0;
-            if (feasibleStreak >= phiWindow)
-            {
-                mixedPhi /= phiTau;
-                if (mixedPhi < phiMin) mixedPhi = phiMin;
-                feasibleStreak = 0;
-            }
         }
         else
         {
             g_mixedInfeas++;
-            infeasibleStreak++;
-            feasibleStreak = 0;
-            if (infeasibleStreak >= phiWindow)
+        }
+
+        if (curOverBW <= EPS)
+        {
+            bwFeasibleStreak++;
+            bwInfeasibleStreak = 0;
+            if (bwFeasibleStreak >= phiWindow)
             {
-                mixedPhi *= phiTau;
-                if (mixedPhi > phiMax) mixedPhi = phiMax;
-                infeasibleStreak = 0;
+                mixedPhiBW /= phiTau;
+                if (mixedPhiBW < phiMin) mixedPhiBW = phiMin;
+                bwFeasibleStreak = 0;
+            }
+        }
+        else
+        {
+            bwInfeasibleStreak++;
+            bwFeasibleStreak = 0;
+            if (bwInfeasibleStreak >= phiWindow)
+            {
+                mixedPhiBW *= phiTau;
+                if (mixedPhiBW > phiMax) mixedPhiBW = phiMax;
+                bwInfeasibleStreak = 0;
+            }
+        }
+
+        if (curOverPW <= EPS)
+        {
+            pwFeasibleStreak++;
+            pwInfeasibleStreak = 0;
+            if (pwFeasibleStreak >= phiWindow)
+            {
+                mixedPhiPW /= phiTau;
+                if (mixedPhiPW < phiMin) mixedPhiPW = phiMin;
+                pwFeasibleStreak = 0;
+            }
+        }
+        else
+        {
+            pwInfeasibleStreak++;
+            pwFeasibleStreak = 0;
+            if (pwInfeasibleStreak >= phiWindow)
+            {
+                mixedPhiPW *= phiTau;
+                if (mixedPhiPW > phiMax) mixedPhiPW = phiMax;
+                pwInfeasibleStreak = 0;
             }
         }
 
@@ -1177,14 +1238,18 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 int pw2 = remPW[b] - taskPWDemand[j];
                 if (!relaxed_rem_ok(b, bw2, pw2)) continue;
 
-                double newOver = curOver - beam_over(b) + beam_over_with_rem(b, bw2, pw2);
+                double newOverBW = curOverBW - beam_bw_over(b) + beam_bw_over_with_rem(b, bw2);
+                double newOverPW = curOverPW - beam_pw_over(b) + beam_pw_over_with_rem(b, pw2);
+                double newOver = newOverBW + newOverPW;
                 if (tabuIter < tabuUntil[j])
                 {
                     if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* aspiration */ }
                     else { g_tabuBlock++; continue; }
                 }
 
-                double deltaEval = (double)deltaProfit - mixedPhi * (newOver - curOver);
+                double deltaEval = (double)deltaProfit
+                    - mixedPhiBW * (newOverBW - curOverBW)
+                    - mixedPhiPW * (newOverPW - curOverPW);
                 record_mixed_candidate(1, j, b, -1, deltaProfit, deltaEval,
                                        bestDeltaEval, bestDeltaProfit, numBest,
                                        kind, a, bb, cc);
@@ -1200,7 +1265,9 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             int deltaProfit = -taskProfit[j];
             int bw2 = remBW[b] + taskBWDemand[j];
             int pw2 = remPW[b] + taskPWDemand[j];
-            double newOver = curOver - beam_over(b) + beam_over_with_rem(b, bw2, pw2);
+            double newOverBW = curOverBW - beam_bw_over(b) + beam_bw_over_with_rem(b, bw2);
+            double newOverPW = curOverPW - beam_pw_over(b) + beam_pw_over_with_rem(b, pw2);
+            double newOver = newOverBW + newOverPW;
 
             if (tabuIter < tabuUntil[j])
             {
@@ -1208,7 +1275,9 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 else { g_tabuBlock++; continue; }
             }
 
-            double deltaEval = (double)deltaProfit - mixedPhi * (newOver - curOver);
+            double deltaEval = (double)deltaProfit
+                - mixedPhiBW * (newOverBW - curOverBW)
+                - mixedPhiPW * (newOverPW - curOverPW);
             record_mixed_candidate(2, j, -1, -1, deltaProfit, deltaEval,
                                    bestDeltaEval, bestDeltaProfit, numBest,
                                    kind, a, bb, cc);
@@ -1233,14 +1302,18 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     int pw2 = remPW[b] + taskPWDemand[k] - taskPWDemand[i];
                     if (!relaxed_rem_ok(b, bw2, pw2)) continue;
 
-                    double newOver = curOver - beam_over(b) + beam_over_with_rem(b, bw2, pw2);
+                    double newOverBW = curOverBW - beam_bw_over(b) + beam_bw_over_with_rem(b, bw2);
+                    double newOverPW = curOverPW - beam_pw_over(b) + beam_pw_over_with_rem(b, pw2);
+                    double newOver = newOverBW + newOverPW;
                     if (tabuIter < tabuUntil[i] || tabuIter < tabuUntil[k])
                     {
                         if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* aspiration */ }
                         else { g_tabuBlock++; continue; }
                     }
 
-                    double deltaEval = (double)deltaProfit - mixedPhi * (newOver - curOver);
+                    double deltaEval = (double)deltaProfit
+                        - mixedPhiBW * (newOverBW - curOverBW)
+                        - mixedPhiPW * (newOverPW - curOverPW);
                     record_mixed_candidate(3, i, b, k, deltaProfit, deltaEval,
                                            bestDeltaEval, bestDeltaProfit, numBest,
                                            kind, a, bb, cc);
@@ -1276,7 +1349,9 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 if (!relaxed_rem_ok_mode(b, m2, bw2, pw2)) continue;
 
                 int deltaProfit = -loss;
-                double newOver = curOver - beam_over(b) + beam_over_with_rem_mode(b, m2, bw2, pw2);
+                double newOverBW = curOverBW - beam_bw_over(b) + beam_bw_over_with_rem(b, bw2);
+                double newOverPW = curOverPW - beam_pw_over(b) + beam_pw_over_with_rem_mode(b, m2, pw2);
+                double newOver = newOverBW + newOverPW;
                 if (tabuIter < tabuBeamMode[b] || evictTabu)
                 {
                     if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* aspiration */ }
@@ -1284,7 +1359,9 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 }
 
                 g_flipCand++;
-                double deltaEval = (double)deltaProfit - mixedPhi * (newOver - curOver);
+                double deltaEval = (double)deltaProfit
+                    - mixedPhiBW * (newOverBW - curOverBW)
+                    - mixedPhiPW * (newOverPW - curOverPW);
                 record_mixed_candidate(4, b, m2, -1, deltaProfit, deltaEval,
                                        bestDeltaEval, bestDeltaProfit, numBest,
                                        kind, a, bb, cc);
@@ -1311,10 +1388,15 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 if (relaxed_rem_ok(b1, b1BW, b1PW) &&
                     relaxed_rem_ok(b2, b2BW, b2PW))
                 {
-                    double newOver = curOver
-                        - beam_over(b1) - beam_over(b2)
-                        + beam_over_with_rem(b1, b1BW, b1PW)
-                        + beam_over_with_rem(b2, b2BW, b2PW);
+                    double newOverBW = curOverBW
+                        - beam_bw_over(b1) - beam_bw_over(b2)
+                        + beam_bw_over_with_rem(b1, b1BW)
+                        + beam_bw_over_with_rem(b2, b2BW);
+                    double newOverPW = curOverPW
+                        - beam_pw_over(b1) - beam_pw_over(b2)
+                        + beam_pw_over_with_rem(b1, b1PW)
+                        + beam_pw_over_with_rem(b2, b2PW);
+                    double newOver = newOverBW + newOverPW;
 
                     if (tabuIter < tabuUntil[i])
                     {
@@ -1322,7 +1404,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                         else { g_tabuBlock++; continue; }
                     }
 
-                    double deltaEval = -mixedPhi * (newOver - curOver);
+                    double deltaEval = -mixedPhiBW * (newOverBW - curOverBW)
+                                       -mixedPhiPW * (newOverPW - curOverPW);
                     g_crossCand++;
                     g_crossRelocCand++;
                     record_mixed_candidate(5, i, b2, -1, 0, deltaEval,
@@ -1344,10 +1427,15 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     if (!relaxed_rem_ok(b1, b1BW, b1PW)) continue;
                     if (!relaxed_rem_ok(b2, b2BW, b2PW)) continue;
 
-                    double newOver = curOver
-                        - beam_over(b1) - beam_over(b2)
-                        + beam_over_with_rem(b1, b1BW, b1PW)
-                        + beam_over_with_rem(b2, b2BW, b2PW);
+                    double newOverBW = curOverBW
+                        - beam_bw_over(b1) - beam_bw_over(b2)
+                        + beam_bw_over_with_rem(b1, b1BW)
+                        + beam_bw_over_with_rem(b2, b2BW);
+                    double newOverPW = curOverPW
+                        - beam_pw_over(b1) - beam_pw_over(b2)
+                        + beam_pw_over_with_rem(b1, b1PW)
+                        + beam_pw_over_with_rem(b2, b2PW);
+                    double newOver = newOverBW + newOverPW;
 
                     if (tabuIter < tabuUntil[i] || tabuIter < tabuUntil[k])
                     {
@@ -1355,7 +1443,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                         else { g_tabuBlock++; continue; }
                     }
 
-                    double deltaEval = -mixedPhi * (newOver - curOver);
+                    double deltaEval = -mixedPhiBW * (newOverBW - curOverBW)
+                                       -mixedPhiPW * (newOverPW - curOverPW);
                     g_crossCand++;
                     g_crossSwapCand++;
                     record_mixed_candidate(5, i, b2, k, 0, deltaEval,
@@ -1439,7 +1528,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             g_applyCross++;
         }
 
-        curOver = total_over();
+        total_over_parts(curOverBW, curOverPW);
+        curOver = curOverBW + curOverPW;
         if (curOver > g_mixedMaxOver) g_mixedMaxOver = curOver;
 
         if (curOver <= EPS && totalProfit > bestProfit)
@@ -1463,7 +1553,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
 //
 // Starting from the current phase-best solution:
 //
-//  Destroy: pick 35% of the beams, strip every
+//  Destroy: pick 30% of the beams, strip every
 //  task off them (back to the unserved pool) and reset their mode to -1
 //  ("empty"), leaving a partial solution.  Untouched beams keep both
 //  their mode and their assigned tasks.
@@ -1776,7 +1866,8 @@ void ils()
          << " (" << (g_mixedIters ? 100.0 * g_mixedInfeas / g_mixedIters : 0) << "%)"
          << "  best_updates=" << g_mixedBestUpdate
          << "  max_over=" << g_mixedMaxOver
-         << "  final_phi=" << mixedPhi << endl;
+         << "  final_phi_bw=" << mixedPhiBW
+         << "  final_phi_pw=" << mixedPhiPW << endl;
     cout << "[PROFILE] move_applied:"
          << " insert=" << g_applyInsert
          << " remove=" << g_applyRemove
