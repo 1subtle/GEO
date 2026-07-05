@@ -1209,7 +1209,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
     const double EPS = 1e-12;
     const int mixedDepth = 300;
     const int phiWindow = 5;
-    const double phiTau = 2.0;
+    const double phiTau = 1.5;
     const double phiMin = 100.0;
     const double phiMax = 100000.0;
 
