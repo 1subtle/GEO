@@ -64,6 +64,8 @@ int **typeProfitSum; // typeProfitSum[b][t]：波束 b 上类型 t 的已服务�
 int *bucketTask;     // 长度 numTask：按波束连续存放的已服务任务编号
 int *bucketStart;    // 长度 numBeam+1：波束 b 的区间为 [bucketStart[b], bucketStart[b+1])
 double *mixedBeamOverBW, *mixedBeamOverPW;
+int *n5SourceBeam, *n5TargetBeam;
+double *n5SourceScore, *n5TargetScore;
 int **insertMinPW;   // insertMinPW[m][bw]：模式 m 下、BW 不超过 bw 的未服务任务最小 PW
 int  maxBeamBWCap;
 
@@ -127,6 +129,10 @@ double g_mixedMaxOver = 0.0;  // 访问过的最大归一化总超载
 double g_mixedMaxRhoBW = 0.0; // 使用过的最大 BW 放宽半径
 double g_mixedMaxRhoPW = 0.0; // 使用过的最大 PW 放宽半径
 double g_mixedTime = 0.0;     // 混合搜索累计 CPU 时间
+long long g_n5CriticalPass = 0;
+long long g_n5FullPass = 0;
+long long g_n5FallbackFull = 0;
+long long g_n5BeamPairFiltered = 0;
 
 static char g_line[MAXLINE];
 
@@ -776,6 +782,10 @@ void alloc_search()
     bucketStart  = new int[numBeam + 1];
     mixedBeamOverBW = new double[numBeam];
     mixedBeamOverPW = new double[numBeam];
+    n5SourceBeam = new int[numBeam];
+    n5TargetBeam = new int[numBeam];
+    n5SourceScore = new double[numBeam];
+    n5TargetScore = new double[numBeam];
     orphanWorkBW = new int[numBeam];
     orphanWorkPW = new int[numBeam];
     orphanTask = new int[numTask];
@@ -1527,6 +1537,178 @@ void local_search(double beginTime)
     g_lsTime += ((double)clock() - lsStart) / CLOCKS_PER_SEC;
 }
 
+void select_n5_critical_beams()
+{
+    int keep = (4 * numBeam + 9) / 10;
+    if (keep < 2) keep = numBeam < 2 ? numBeam : 2;
+    if (keep > numBeam) keep = numBeam;
+
+    for (int b = 0; b < numBeam; b++)
+    {
+        n5SourceBeam[b] = 0;
+        n5TargetBeam[b] = 0;
+
+        int bwCap = beamBWCap[b] > 0 ? beamBWCap[b] : 1;
+        int pwCap = beamPWCap[b] - modeBasePower[beamMode[b]];
+        if (pwCap < 1) pwCap = 1;
+
+        double bwUsed = 1.0 - (double)remBW[b] / bwCap;
+        double pwUsed = 1.0 - (double)remPW[b] / pwCap;
+        n5SourceScore[b] = bwUsed > pwUsed ? bwUsed : pwUsed;
+
+        double bwSlack = (double)remBW[b] / bwCap;
+        double pwSlack = (double)remPW[b] / pwCap;
+        n5TargetScore[b] = bwSlack < pwSlack ? bwSlack : pwSlack;
+    }
+
+    for (int q = 0; q < keep; q++)
+    {
+        int source = -1, target = -1;
+        for (int b = 0; b < numBeam; b++)
+        {
+            if (!n5SourceBeam[b] &&
+                (source < 0 || n5SourceScore[b] > n5SourceScore[source]))
+                source = b;
+            if (!n5TargetBeam[b] &&
+                (target < 0 || n5TargetScore[b] > n5TargetScore[target]))
+                target = b;
+        }
+        if (source >= 0) n5SourceBeam[source] = 1;
+        if (target >= 0) n5TargetBeam[target] = 1;
+    }
+}
+
+long long search_mixed_cross(int criticalOnly,
+                             double curOverBW, double curOverPW,
+                             double &bestDeltaEval, int &numBest,
+                             int &kind, int &a, int &bb, int &cc)
+{
+    const double EPS = 1e-12;
+    long long admitted = 0;
+
+    for (int i = 0; i < numTask; i++)
+    {
+        int b1 = taskBeam[i];
+        if (b1 < 0) continue;
+        if (criticalOnly && !n5SourceBeam[b1] && !n5TargetBeam[b1]) continue;
+
+        if (tabuIter < tabuUntil[i] && totalProfit <= bestProfit)
+        {
+            g_tabuBlock++;
+            continue;
+        }
+
+        int ti = taskType[i] - 1;
+        for (int b2 = 0; b2 < numBeam; b2++)
+        {
+            if (b2 == b1) continue;
+
+            int relocAllowed = !criticalOnly ||
+                               (n5SourceBeam[b1] && n5TargetBeam[b2]);
+            int swapAllowed = !criticalOnly ||
+                              (n5SourceBeam[b1] && n5TargetBeam[b2]) ||
+                              (n5TargetBeam[b1] && n5SourceBeam[b2]);
+            if (!relocAllowed && !swapAllowed)
+            {
+                g_n5BeamPairFiltered++;
+                continue;
+            }
+
+            if (beamMode[b2] < 0) continue;
+            if (!typeCompatMode[ti][beamMode[b2]]) continue;
+
+            int b1BW = remBW[b1] + taskBWDemand[i];
+            int b1PW = remPW[b1] + taskPWDemand[i];
+            int b2BW = remBW[b2] - taskBWDemand[i];
+            int b2PW = remPW[b2] - taskPWDemand[i];
+            if (relocAllowed && relaxed_rem_ok(b1, b1BW, b1PW) &&
+                relaxed_rem_ok(b2, b2BW, b2PW))
+            {
+                double newOverBW = curOverBW
+                    - mixedBeamOverBW[b1] - mixedBeamOverBW[b2]
+                    + beam_bw_over_with_rem(b1, b1BW)
+                    + beam_bw_over_with_rem(b2, b2BW);
+                double newOverPW = curOverPW
+                    - mixedBeamOverPW[b1] - mixedBeamOverPW[b2]
+                    + beam_pw_over_with_rem(b1, b1PW)
+                    + beam_pw_over_with_rem(b2, b2PW);
+                double newOver = newOverBW + newOverPW;
+
+                int relocTabuBlocked = 0;
+                if (tabuIter < tabuUntil[i])
+                {
+                    if (!(newOver <= EPS && totalProfit > bestProfit))
+                    {
+                        g_tabuBlock++;
+                        relocTabuBlocked = 1;
+                    }
+                }
+
+                if (!relocTabuBlocked)
+                {
+                    double deltaEval = -mixedPhiBW * (newOverBW - curOverBW)
+                                       -mixedPhiPW * (newOverPW - curOverPW);
+                    g_crossCand++;
+                    g_crossRelocCand++;
+                    admitted++;
+                    record_mixed_candidate(5, i, b2, -1, deltaEval,
+                                           bestDeltaEval, numBest,
+                                           kind, a, bb, cc);
+                }
+            }
+
+            if (!swapAllowed || b1 > b2) continue;
+            for (int idx = bucketStart[b2]; idx < bucketStart[b2 + 1]; idx++)
+            {
+                int k = bucketTask[idx];
+                int tk = taskType[k] - 1;
+                if (!typeCompatMode[tk][beamMode[b1]]) continue;
+                if (tabuIter < tabuUntil[k] && totalProfit <= bestProfit)
+                {
+                    g_tabuBlock++;
+                    continue;
+                }
+
+                b1BW = remBW[b1] + taskBWDemand[i] - taskBWDemand[k];
+                b1PW = remPW[b1] + taskPWDemand[i] - taskPWDemand[k];
+                b2BW = remBW[b2] + taskBWDemand[k] - taskBWDemand[i];
+                b2PW = remPW[b2] + taskPWDemand[k] - taskPWDemand[i];
+                if (!relaxed_rem_ok(b1, b1BW, b1PW)) continue;
+                if (!relaxed_rem_ok(b2, b2BW, b2PW)) continue;
+
+                double newOverBW = curOverBW
+                    - mixedBeamOverBW[b1] - mixedBeamOverBW[b2]
+                    + beam_bw_over_with_rem(b1, b1BW)
+                    + beam_bw_over_with_rem(b2, b2BW);
+                double newOverPW = curOverPW
+                    - mixedBeamOverPW[b1] - mixedBeamOverPW[b2]
+                    + beam_pw_over_with_rem(b1, b1PW)
+                    + beam_pw_over_with_rem(b2, b2PW);
+                double newOver = newOverBW + newOverPW;
+
+                if (tabuIter < tabuUntil[i] || tabuIter < tabuUntil[k])
+                {
+                    if (!(newOver <= EPS && totalProfit > bestProfit))
+                    {
+                        g_tabuBlock++;
+                        continue;
+                    }
+                }
+
+                double deltaEval = -mixedPhiBW * (newOverBW - curOverBW)
+                                   -mixedPhiPW * (newOverPW - curOverPW);
+                g_crossCand++;
+                g_crossSwapCand++;
+                admitted++;
+                record_mixed_candidate(5, i, b2, k, deltaEval,
+                                       bestDeltaEval, numBest,
+                                       kind, a, bb, cc);
+            }
+        }
+    }
+    return admitted;
+}
+
 //--------------------------------------------------------------------
 // local_search_mixed：可行域与不可行域混合禁忌搜索。
 // BW/PW 容量约束可在小范围内放宽；模式兼容和每个任务至多分配给一个
@@ -1784,103 +1966,30 @@ void local_search_mixed(double beginTime)
         // 邻域 5：带动态虚拟空位的跨波束交换
         if (!useOrphan && bestDeltaEval <= EPS)
         {
-        for (int i = 0; i < numTask; i++)
-        {
-            int b1 = taskBeam[i];
-            if (b1 < 0) continue;
-
-            // Cross 的收益增量恒为 0。当前收益未超过阶段最好解时，
-            // 禁忌任务不可能通过特赦，直接跳过整行目标波束扫描。
-            if (tabuIter < tabuUntil[i] && totalProfit <= bestProfit)
+            int periodicFull = (tabuIter % 15 == 0) ||
+                               (nonImprove >= 50 && nonImprove % 5 == 0);
+            if (periodicFull)
             {
-                g_tabuBlock++;
-                continue;
+                g_n5FullPass++;
+                search_mixed_cross(0, curOverBW, curOverPW,
+                                   bestDeltaEval, numBest, kind, a, bb, cc);
             }
-
-            int ti = taskType[i] - 1;
-            for (int b2 = 0; b2 < numBeam; b2++)
+            else
             {
-                if (b2 == b1) continue;
-                if (beamMode[b2] < 0) continue;
-                if (!typeCompatMode[ti][beamMode[b2]]) continue;
-
-                int b1BW = remBW[b1] + taskBWDemand[i];
-                int b1PW = remPW[b1] + taskPWDemand[i];
-                int b2BW = remBW[b2] - taskBWDemand[i];
-                int b2PW = remPW[b2] - taskPWDemand[i];
-                if (relaxed_rem_ok(b1, b1BW, b1PW) &&
-                    relaxed_rem_ok(b2, b2BW, b2PW))
+                select_n5_critical_beams();
+                g_n5CriticalPass++;
+                long long admitted = search_mixed_cross(
+                    1, curOverBW, curOverPW,
+                    bestDeltaEval, numBest, kind, a, bb, cc);
+                if (admitted == 0)
                 {
-                    double newOverBW = curOverBW
-                        - mixedBeamOverBW[b1] - mixedBeamOverBW[b2]
-                        + beam_bw_over_with_rem(b1, b1BW)
-                        + beam_bw_over_with_rem(b2, b2BW);
-                    double newOverPW = curOverPW
-                        - mixedBeamOverPW[b1] - mixedBeamOverPW[b2]
-                        + beam_pw_over_with_rem(b1, b1PW)
-                        + beam_pw_over_with_rem(b2, b2PW);
-                    double newOver = newOverBW + newOverPW;
-
-                    if (tabuIter < tabuUntil[i])
-                    {
-                        if (newOver <= EPS && totalProfit > bestProfit) { /* 特赦 */ }
-                        else { g_tabuBlock++; continue; }
-                    }
-
-                    double deltaEval = -mixedPhiBW * (newOverBW - curOverBW)
-                                       -mixedPhiPW * (newOverPW - curOverPW);
-                    g_crossCand++;
-                    g_crossRelocCand++;
-                    record_mixed_candidate(5, i, b2, -1, deltaEval,
-                                           bestDeltaEval, numBest,
-                                           kind, a, bb, cc);
-                }
-
-                if (b1 > b2) continue;
-                for (int idx = bucketStart[b2]; idx < bucketStart[b2 + 1]; idx++)
-                {
-                    int k = bucketTask[idx];
-                    int tk = taskType[k] - 1;
-                    if (!typeCompatMode[tk][beamMode[b1]]) continue;
-                    if (tabuIter < tabuUntil[k] && totalProfit <= bestProfit)
-                    {
-                        g_tabuBlock++;
-                        continue;
-                    }
-
-                    b1BW = remBW[b1] + taskBWDemand[i] - taskBWDemand[k];
-                    b1PW = remPW[b1] + taskPWDemand[i] - taskPWDemand[k];
-                    b2BW = remBW[b2] + taskBWDemand[k] - taskBWDemand[i];
-                    b2PW = remPW[b2] + taskPWDemand[k] - taskPWDemand[i];
-                    if (!relaxed_rem_ok(b1, b1BW, b1PW)) continue;
-                    if (!relaxed_rem_ok(b2, b2BW, b2PW)) continue;
-
-                    double newOverBW = curOverBW
-                        - mixedBeamOverBW[b1] - mixedBeamOverBW[b2]
-                        + beam_bw_over_with_rem(b1, b1BW)
-                        + beam_bw_over_with_rem(b2, b2BW);
-                    double newOverPW = curOverPW
-                        - mixedBeamOverPW[b1] - mixedBeamOverPW[b2]
-                        + beam_pw_over_with_rem(b1, b1PW)
-                        + beam_pw_over_with_rem(b2, b2PW);
-                    double newOver = newOverBW + newOverPW;
-
-                    if (tabuIter < tabuUntil[i] || tabuIter < tabuUntil[k])
-                    {
-                        if (newOver <= EPS && totalProfit > bestProfit) { /* 特赦 */ }
-                        else { g_tabuBlock++; continue; }
-                    }
-
-                    double deltaEval = -mixedPhiBW * (newOverBW - curOverBW)
-                                       -mixedPhiPW * (newOverPW - curOverPW);
-                    g_crossCand++;
-                    g_crossSwapCand++;
-                    record_mixed_candidate(5, i, b2, k, deltaEval,
-                                           bestDeltaEval, numBest,
-                                           kind, a, bb, cc);
+                    g_n5FallbackFull++;
+                    g_n5FullPass++;
+                    search_mixed_cross(0, curOverBW, curOverPW,
+                                       bestDeltaEval, numBest,
+                                       kind, a, bb, cc);
                 }
             }
-        }
         }
 
         if (numBest == 0 && !useOrphan)
@@ -2270,6 +2379,10 @@ void ils()
          << " filtered=" << g_crossFiltered
          << " reloc_applied=" << g_crossRelocApplied
          << " swap_applied=" << g_crossSwapApplied << endl;
+    cout << "[PROFILE] n5_beam_reduction: critical_pass=" << g_n5CriticalPass
+         << " full_pass=" << g_n5FullPass
+         << " fallback_full=" << g_n5FallbackFull
+         << " beam_pairs_filtered=" << g_n5BeamPairFiltered << endl;
     cout << "[PROFILE] orphan_calls=" << g_orphanCalls
          << " trials=" << g_orphanTrials
          << " steps=" << g_orphanSteps
@@ -2413,6 +2526,10 @@ void free_memory()
     delete[] bucketStart;
     delete[] mixedBeamOverBW;
     delete[] mixedBeamOverPW;
+    delete[] n5SourceBeam;
+    delete[] n5TargetBeam;
+    delete[] n5SourceScore;
+    delete[] n5TargetScore;
     delete[] orphanWorkBW;
     delete[] orphanWorkPW;
     delete[] orphanTask;
