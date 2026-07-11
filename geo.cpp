@@ -63,6 +63,7 @@ int **typeProfitSum; // typeProfitSum[b][t]：波束 b 上类型 t 的已服务�
 // 使交换邻域能够跳过无关任务。
 int *bucketTask;     // 长度 numTask：按波束连续存放的已服务任务编号
 int *bucketStart;    // 长度 numBeam+1：波束 b 的区间为 [bucketStart[b], bucketStart[b+1])
+double *mixedBeamOverBW, *mixedBeamOverPW;
 int **insertMinPW;   // insertMinPW[m][bw]：模式 m 下、BW 不超过 bw 的未服务任务最小 PW
 int  maxBeamBWCap;
 
@@ -77,6 +78,7 @@ int orphanBestDeltaProfit;
 double orphanBestDeltaEval;
 int orphanBestAspired;
 double orphanBaseOverBW, orphanBaseOverPW;
+double orphanWorkOverBW, orphanWorkOverPW;
 
 // ---- 全程累计的性能统计计数器 ----
 long long g_lsIters   = 0;   // local_search 内层总迭代数
@@ -625,6 +627,24 @@ int relaxed_rem_ok(int b, int bwFree, int pwFree)
     return relaxed_rem_ok_mode(b, beamMode[b], bwFree, pwFree);
 }
 
+// 按当前 taskBeam 重建已服务任务 CSR 桶。严格阶段先检查不依赖桶的
+// Insert；只有 Insert 未首接受时才调用，避免无效的 O(N+B) 重建。
+void rebuild_task_bucket()
+{
+    for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
+    for (int j = 0; j < numTask; j++)
+        if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
+    for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
+    for (int j = 0; j < numTask; j++)
+        if (taskBeam[j] >= 0)
+        {
+            int b = taskBeam[j];
+            bucketTask[bucketStart[b]++] = j;
+        }
+    for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
+    bucketStart[0] = 0;
+}
+
 void rebuild_insert_filter()
 {
     const int INF = 1000000000;
@@ -779,6 +799,8 @@ void alloc_search()
     tabuUntil    = new int[numTask];
     bucketTask   = new int[numTask];
     bucketStart  = new int[numBeam + 1];
+    mixedBeamOverBW = new double[numBeam];
+    mixedBeamOverPW = new double[numBeam];
     orphanWorkBW = new int[numBeam];
     orphanWorkPW = new int[numBeam];
     orphanTask = new int[numTask];
@@ -874,23 +896,21 @@ void orphan_consider_leaf(int count, int tailDest, int relaxed)
     int tail = orphanTask[count - 1];
     int deltaProfit = tailDest >= 0 ? taskProfit[orphanTask[0]]
                                     : taskProfit[orphanTask[0]] - taskProfit[tail];
-    double newOverBW = 0.0, newOverPW = 0.0;
+    double newOverBW = orphanWorkOverBW;
+    double newOverPW = orphanWorkOverPW;
 
     g_orphanTrials++;
     if (tailDest >= 0) g_orphanRelocLeaf++;
     else               g_orphanDropLeaf++;
 
-    for (int b = 0; b < numBeam; b++)
+    if (tailDest >= 0)
     {
-        int bwFree = orphanWorkBW[b];
-        int pwFree = orphanWorkPW[b];
-        if (b == tailDest)
-        {
-            bwFree -= taskBWDemand[tail];
-            pwFree -= taskPWDemand[tail];
-        }
-        newOverBW += beam_bw_over_with_rem(b, bwFree);
-        newOverPW += beam_pw_over_with_rem(b, pwFree);
+        int bwFree = orphanWorkBW[tailDest] - taskBWDemand[tail];
+        int pwFree = orphanWorkPW[tailDest] - taskPWDemand[tail];
+        newOverBW += beam_bw_over_with_rem(tailDest, bwFree)
+            - beam_bw_over_with_rem(tailDest, orphanWorkBW[tailDest]);
+        newOverPW += beam_pw_over_with_rem(tailDest, pwFree)
+            - beam_pw_over_with_rem(tailDest, orphanWorkPW[tailDest]);
     }
 
     if (!relaxed && deltaProfit <= 0) return;
@@ -955,6 +975,13 @@ int orphan_select_next(int orphan, int count, int relaxed, int &bestBeam)
         if (beamMode[b] < 0) continue;
         if (!typeCompatMode[t][beamMode[b]]) continue;
 
+        double oldBW = 0.0, oldPW = 0.0;
+        if (relaxed)
+        {
+            oldBW = beam_bw_over_with_rem(b, orphanWorkBW[b]);
+            oldPW = beam_pw_over_with_rem(b, orphanWorkPW[b]);
+        }
+
         for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
         {
             int k = bucketTask[idx];
@@ -976,8 +1003,6 @@ int orphan_select_next(int orphan, int count, int relaxed, int &bestBeam)
             int slack = bw2 + pw2;
             if (relaxed)
             {
-                double oldBW = beam_bw_over_with_rem(b, orphanWorkBW[b]);
-                double oldPW = beam_pw_over_with_rem(b, orphanWorkPW[b]);
                 double newBW = beam_bw_over_with_rem(b, bw2);
                 double newPW = beam_pw_over_with_rem(b, pw2);
                 double eval = (double)(taskProfit[orphan] - taskProfit[k])
@@ -1018,6 +1043,8 @@ void orphan_grow(int root, int relaxed)
         orphanWorkBW[b] = remBW[b];
         orphanWorkPW[b] = remPW[b];
     }
+    orphanWorkOverBW = orphanBaseOverBW;
+    orphanWorkOverPW = orphanBaseOverPW;
 
     for (int depth = 0; depth < ORPHAN_EC_MAXLEN; depth++)
     {
@@ -1025,8 +1052,12 @@ void orphan_grow(int root, int relaxed)
         int next = orphan_select_next(orphan, count, relaxed, source);
         if (next < 0) break;
 
+        double oldBW = beam_bw_over_with_rem(source, orphanWorkBW[source]);
+        double oldPW = beam_pw_over_with_rem(source, orphanWorkPW[source]);
         orphanWorkBW[source] += taskBWDemand[next] - taskBWDemand[orphan];
         orphanWorkPW[source] += taskPWDemand[next] - taskPWDemand[orphan];
+        orphanWorkOverBW += beam_bw_over_with_rem(source, orphanWorkBW[source]) - oldBW;
+        orphanWorkOverPW += beam_pw_over_with_rem(source, orphanWorkPW[source]) - oldPW;
         orphanDest[count - 1] = source;
         orphanTask[count] = next;
         count++;
@@ -1150,23 +1181,6 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         int numBest   = 0;               // 找到首个达到阈值的动作后变为 1
         int kind = 0, a = -1, bb = -1, cc = -1;
 
-        // 重建按波束分组的已服务任务 CSR 桶。
-        // 对 taskBeam 使用计数排序，每次迭代复杂度为 O(numTask + numBeam)。
-        for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
-        for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
-        // 使用每个波束的局部游标填桶，并复用 bucketStart 作为游标
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0)
-            {
-                int b = taskBeam[j];
-                bucketTask[bucketStart[b]++] = j;
-            }
-        // 撤销游标推进，使 bucketStart[b] 重新指向波束 b 的起点
-        for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
-        bucketStart[0] = 0;
-
         // 邻域 1：插入一个未服务任务
         for (int j = 0; j < numTask && numBest == 0; j++)
         {
@@ -1187,6 +1201,8 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
                                  bestDelta, numBest, kind, a, bb, cc);
             }
         }
+
+        if (numBest == 0) rebuild_task_bucket();
 
         // 邻域 3，第二个搜索：未服务任务 i 替换已服务任务 k。
         // 对每个未服务任务 i，只访问模式与其兼容的波束，并只扫描该波束
@@ -1613,18 +1629,12 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
         int numBest = 0;
         int kind = 0, a = -1, bb = -1, cc = -1;
 
-        for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
-        for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0)
-            {
-                int b = taskBeam[j];
-                bucketTask[bucketStart[b]++] = j;
-            }
-        for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
-        bucketStart[0] = 0;
+        rebuild_task_bucket();
+        for (int b = 0; b < numBeam; b++)
+        {
+            mixedBeamOverBW[b] = beam_bw_over(b);
+            mixedBeamOverPW[b] = beam_pw_over(b);
+        }
 
         // 邻域 1：插入一个未服务任务
         for (int j = 0; j < numTask; j++)
@@ -1642,8 +1652,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 int pw2 = remPW[b] - taskPWDemand[j];
                 if (!relaxed_rem_ok(b, bw2, pw2)) continue;
 
-                double newOverBW = curOverBW - beam_bw_over(b) + beam_bw_over_with_rem(b, bw2);
-                double newOverPW = curOverPW - beam_pw_over(b) + beam_pw_over_with_rem(b, pw2);
+                double newOverBW = curOverBW - mixedBeamOverBW[b] + beam_bw_over_with_rem(b, bw2);
+                double newOverPW = curOverPW - mixedBeamOverPW[b] + beam_pw_over_with_rem(b, pw2);
                 double newOver = newOverBW + newOverPW;
                 if (tabuIter < tabuUntil[j])
                 {
@@ -1669,8 +1679,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             int deltaProfit = -taskProfit[j];
             int bw2 = remBW[b] + taskBWDemand[j];
             int pw2 = remPW[b] + taskPWDemand[j];
-            double newOverBW = curOverBW - beam_bw_over(b) + beam_bw_over_with_rem(b, bw2);
-            double newOverPW = curOverPW - beam_pw_over(b) + beam_pw_over_with_rem(b, pw2);
+            double newOverBW = curOverBW - mixedBeamOverBW[b] + beam_bw_over_with_rem(b, bw2);
+            double newOverPW = curOverPW - mixedBeamOverPW[b] + beam_pw_over_with_rem(b, pw2);
             double newOver = newOverBW + newOverPW;
 
             if (tabuIter < tabuUntil[j])
@@ -1706,8 +1716,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     int pw2 = remPW[b] + taskPWDemand[k] - taskPWDemand[i];
                     if (!relaxed_rem_ok(b, bw2, pw2)) continue;
 
-                    double newOverBW = curOverBW - beam_bw_over(b) + beam_bw_over_with_rem(b, bw2);
-                    double newOverPW = curOverPW - beam_pw_over(b) + beam_pw_over_with_rem(b, pw2);
+                    double newOverBW = curOverBW - mixedBeamOverBW[b] + beam_bw_over_with_rem(b, bw2);
+                    double newOverPW = curOverPW - mixedBeamOverPW[b] + beam_pw_over_with_rem(b, pw2);
                     double newOver = newOverBW + newOverPW;
                     if (tabuIter < tabuUntil[i] || tabuIter < tabuUntil[k])
                     {
@@ -1753,8 +1763,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 if (!relaxed_rem_ok_mode(b, m2, bw2, pw2)) continue;
 
                 int deltaProfit = -loss;
-                double newOverBW = curOverBW - beam_bw_over(b) + beam_bw_over_with_rem(b, bw2);
-                double newOverPW = curOverPW - beam_pw_over(b) + beam_pw_over_with_rem_mode(b, m2, pw2);
+                double newOverBW = curOverBW - mixedBeamOverBW[b] + beam_bw_over_with_rem(b, bw2);
+                double newOverPW = curOverPW - mixedBeamOverPW[b] + beam_pw_over_with_rem_mode(b, m2, pw2);
                 double newOver = newOverBW + newOverPW;
                 if (tabuIter < tabuBeamMode[b] || evictTabu)
                 {
@@ -1789,6 +1799,14 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             int b1 = taskBeam[i];
             if (b1 < 0) continue;
 
+            // Cross 的收益增量恒为 0。当前收益未超过阶段最好解时，
+            // 禁忌任务不可能通过特赦，直接跳过整行目标波束扫描。
+            if (tabuIter < tabuUntil[i] && totalProfit <= bestProfit)
+            {
+                g_tabuBlock++;
+                continue;
+            }
+
             int ti = taskType[i] - 1;
             for (int b2 = 0; b2 < numBeam; b2++)
             {
@@ -1804,11 +1822,11 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     relaxed_rem_ok(b2, b2BW, b2PW))
                 {
                     double newOverBW = curOverBW
-                        - beam_bw_over(b1) - beam_bw_over(b2)
+                        - mixedBeamOverBW[b1] - mixedBeamOverBW[b2]
                         + beam_bw_over_with_rem(b1, b1BW)
                         + beam_bw_over_with_rem(b2, b2BW);
                     double newOverPW = curOverPW
-                        - beam_pw_over(b1) - beam_pw_over(b2)
+                        - mixedBeamOverPW[b1] - mixedBeamOverPW[b2]
                         + beam_pw_over_with_rem(b1, b1PW)
                         + beam_pw_over_with_rem(b2, b2PW);
                     double newOver = newOverBW + newOverPW;
@@ -1834,6 +1852,11 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     int k = bucketTask[idx];
                     int tk = taskType[k] - 1;
                     if (!typeCompatMode[tk][beamMode[b1]]) continue;
+                    if (tabuIter < tabuUntil[k] && totalProfit <= bestProfit)
+                    {
+                        g_tabuBlock++;
+                        continue;
+                    }
 
                     b1BW = remBW[b1] + taskBWDemand[i] - taskBWDemand[k];
                     b1PW = remPW[b1] + taskPWDemand[i] - taskPWDemand[k];
@@ -1843,11 +1866,11 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     if (!relaxed_rem_ok(b2, b2BW, b2PW)) continue;
 
                     double newOverBW = curOverBW
-                        - beam_bw_over(b1) - beam_bw_over(b2)
+                        - mixedBeamOverBW[b1] - mixedBeamOverBW[b2]
                         + beam_bw_over_with_rem(b1, b1BW)
                         + beam_bw_over_with_rem(b2, b2BW);
                     double newOverPW = curOverPW
-                        - beam_pw_over(b1) - beam_pw_over(b2)
+                        - mixedBeamOverPW[b1] - mixedBeamOverPW[b2]
                         + beam_pw_over_with_rem(b1, b1PW)
                         + beam_pw_over_with_rem(b2, b2PW);
                     double newOver = newOverBW + newOverPW;
@@ -2465,6 +2488,8 @@ void free_memory()
     delete[] tabuUntil;
     delete[] bucketTask;
     delete[] bucketStart;
+    delete[] mixedBeamOverBW;
+    delete[] mixedBeamOverPW;
     delete[] orphanWorkBW;
     delete[] orphanWorkPW;
     delete[] orphanTask;
