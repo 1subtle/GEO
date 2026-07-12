@@ -107,6 +107,13 @@ long long g_flipCand    = 0; // 已评价的可行模式翻转候选数
 long long g_flipApplied = 0; // 已执行的模式翻转动作数
 long long g_flipApplyToMode[16] = {0}; // 按目标模式统计已执行翻转数
 
+// ---- 阶段级"模式打磨"下降（增益感知的复合模式翻转）统计 ----
+int       g_polishEnabled = 0;   // 是否启用（按算例规模开关，保护大算例吞吐）
+long long g_polishSweeps  = 0;   // 打磨扫描总次数
+long long g_polishApplied = 0;   // 已提交的正收益单束翻转数
+long long g_polishGain    = 0;   // 打磨累计净收益
+double    g_polishTime    = 0.0; // 打磨累计 CPU 时间
+
 // ---- 可行域/不可行域混合搜索状态 -----------------------
 double mixedPhiBW = 1000.0;   // 归一化 BW 超载的惩罚权重
 double mixedPhiPW = 1000.0;   // 归一化 PW 超载的惩罚权重
@@ -944,7 +951,7 @@ int orphan_select_next(int orphan, int count, int relaxed, int &bestBeam)
     const double EPS = 1e-12;
     int bestTask = -1;
     int bestTabuGroup = 2;
-    int bestProfit = 0, bestSlack = 0;
+    int bestEvictProfit = 0, bestSlack = 0;   // 被驱逐任务收益（勿与全局 bestProfit 混淆）
     double bestEval = -1.0e100;
     int chainTabu = orphan_chain_has_tabu(count);
     int t = taskType[orphan] - 1;
@@ -984,14 +991,14 @@ int orphan_select_next(int orphan, int count, int relaxed, int &bestBeam)
                     - mixedPhiBW * (newBW - oldBW)
                     - mixedPhiPW * (newPW - oldPW);
                 if (tabuGroup < bestTabuGroup || eval > bestEval + EPS ||
-                    (eval >= bestEval - EPS && taskProfit[k] < bestProfit) ||
-                    (eval >= bestEval - EPS && taskProfit[k] == bestProfit &&
+                    (eval >= bestEval - EPS && taskProfit[k] < bestEvictProfit) ||
+                    (eval >= bestEval - EPS && taskProfit[k] == bestEvictProfit &&
                      slack > bestSlack))
                     take = 1;
                 if (take) bestEval = eval;
             }
-            else if (tabuGroup < bestTabuGroup || taskProfit[k] < bestProfit ||
-                     (taskProfit[k] == bestProfit && slack > bestSlack))
+            else if (tabuGroup < bestTabuGroup || taskProfit[k] < bestEvictProfit ||
+                     (taskProfit[k] == bestEvictProfit && slack > bestSlack))
                 take = 1;
 
             if (take)
@@ -999,7 +1006,7 @@ int orphan_select_next(int orphan, int count, int relaxed, int &bestBeam)
                 bestTask = k;
                 bestBeam = b;
                 bestTabuGroup = tabuGroup;
-                bestProfit = taskProfit[k];
+                bestEvictProfit = taskProfit[k];
                 bestSlack = slack;
             }
         }
@@ -1125,6 +1132,110 @@ void apply_mode_flip(int b, int m2, int tenure)
 }
 
 //--------------------------------------------------------------------
+// rebuild_buckets：按波束分组重建已服务任务的 CSR 桶，供严格与混合两个
+// 局部搜索的邻域扫描共用。对 taskBeam 做计数排序，复杂度 O(numTask+numBeam)。
+//--------------------------------------------------------------------
+void rebuild_buckets()
+{
+    for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
+    for (int j = 0; j < numTask; j++)
+        if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
+    for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
+    // 使用每个波束的局部游标填桶，并复用 bucketStart 作为游标
+    for (int j = 0; j < numTask; j++)
+        if (taskBeam[j] >= 0)
+        {
+            int b = taskBeam[j];
+            bucketTask[bucketStart[b]++] = j;
+        }
+    // 撤销游标推进，使 bucketStart[b] 重新指向波束 b 的起点
+    for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
+    bucketStart[0] = 0;
+}
+
+//--------------------------------------------------------------------
+// count_aspiration：若已选定动作突破了任务或波束模式禁忌，统计一次特赦。
+// 两个局部搜索在执行动作前调用，特赦口径单一来源、保持一致。
+//--------------------------------------------------------------------
+void count_aspiration(int kind, int a, int cc)
+{
+    if ((kind == 1 && tabuIter < tabuUntil[a]) ||
+        (kind == 2 && tabuIter < tabuUntil[a]) ||
+        (kind == 3 && (tabuIter < tabuUntil[a] || tabuIter < tabuUntil[cc])) ||
+        (kind == 4 && tabuIter < tabuBeamMode[a]) ||
+        (kind == 5 && (tabuIter < tabuUntil[a] ||
+                       (cc >= 0 && tabuIter < tabuUntil[cc]))))
+        g_aspire++;
+}
+
+//--------------------------------------------------------------------
+// apply_move：执行已选定的邻域动作，并同步移动频次、属性禁忌与统计。
+// kind：1 插入  2 纯移除  3 同波束交换  4 模式翻转  5 跨波束交换
+// (cc<0 表示实任务-虚拟空位重定位)。严格与混合两个局部搜索共用，
+// 保证动作语义与禁忌写入只有一处实现，避免改一处漏另一处。
+//--------------------------------------------------------------------
+void apply_move(int kind, int a, int bb, int cc)
+{
+    if (kind == 1)                            // 插入
+    {
+        add_task(a, bb);
+        moveFreq[a]++;
+        tabuUntil[a] = tabuIter + tabu_tenure();
+        g_applyInsert++;
+    }
+    else if (kind == 2)                       // 纯移除
+    {
+        remove_task(a);
+        moveFreq[a]++;
+        tabuUntil[a] = tabuIter + tabu_tenure();
+        g_applyRemove++;
+    }
+    else if (kind == 3)                       // 交换：a 加入、cc 移出
+    {
+        remove_task(cc);
+        add_task(a, bb);
+        moveFreq[a]++; moveFreq[cc]++;
+        tabuUntil[a]  = tabuIter + tabu_tenure();
+        tabuUntil[cc] = tabuIter + tabu_tenure();
+        g_applySwap++;
+    }
+    else if (kind == 4)                       // 把波束 a 的模式翻转为 bb
+    {
+        int tenure = tabu_tenure();
+        apply_mode_flip(a, bb, tenure);
+        tabuBeamMode[a] = tabuIter + tenure;
+        g_applyFlip++;
+        g_flipApplied++;
+        if (bb >= 0 && bb < 16) g_flipApplyToMode[bb]++;
+    }
+    else if (kind == 5)                       // 带虚拟空位的跨波束交换
+    {
+        int b1 = taskBeam[a];
+        if (cc < 0)                           // 实任务-虚拟空位：把 a 重定位到 bb
+        {
+            remove_task(a);
+            add_task(a, bb);
+            moveFreq[a]++;
+            tabuUntil[a] = tabuIter + tabu_tenure();
+            g_crossRelocApplied++;
+        }
+        else                                  // 实任务-实任务：交换 a 和 cc
+        {
+            int b2 = taskBeam[cc];
+            remove_task(a);
+            remove_task(cc);
+            add_task(a, b2);
+            add_task(cc, b1);
+            moveFreq[a]++; moveFreq[cc]++;
+            tabuUntil[a]  = tabuIter + tabu_tenure();
+            tabuUntil[cc] = tabuIter + tabu_tenure();
+            g_crossSwapApplied++;
+        }
+        g_applyCross++;
+    }
+}
+
+//--------------------------------------------------------------------
 void local_search(double beginTime, int *tmpIdx, double *tmpVal)
 {
     (void)tmpIdx;
@@ -1151,21 +1262,7 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         int kind = 0, a = -1, bb = -1, cc = -1;
 
         // 重建按波束分组的已服务任务 CSR 桶。
-        // 对 taskBeam 使用计数排序，每次迭代复杂度为 O(numTask + numBeam)。
-        for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
-        for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
-        // 使用每个波束的局部游标填桶，并复用 bucketStart 作为游标
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0)
-            {
-                int b = taskBeam[j];
-                bucketTask[bucketStart[b]++] = j;
-            }
-        // 撤销游标推进，使 bucketStart[b] 重新指向波束 b 的起点
-        for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
-        bucketStart[0] = 0;
+        rebuild_buckets();
 
         // 邻域 1：插入一个未服务任务
         for (int j = 0; j < numTask && numBest == 0; j++)
@@ -1179,10 +1276,10 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
                 if (totalProfit + delta > bestProfit) { /* 满足特赦 */ }
                 else { g_tabuBlock++; continue; }
             }
+            if (delta < bestDelta) continue;   // delta 与波束无关，提前跳过整轮波束扫描
             for (int b = 0; b < numBeam && numBest == 0; b++)
             {
                 if (!feasible_on(j, b)) continue;
-                if (delta < bestDelta) continue;
                 record_candidate(1, j, b, -1, delta,
                                  bestDelta, numBest, kind, a, bb, cc);
             }
@@ -1439,71 +1536,9 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             continue;
         }
         // 若已提交动作突破了任务或波束模式禁忌，则统计一次特赦
-        if ((kind == 1 && tabuIter < tabuUntil[a]) ||
-            (kind == 2 && tabuIter < tabuUntil[a]) ||
-            (kind == 3 && (tabuIter < tabuUntil[a] || tabuIter < tabuUntil[cc])) ||
-            (kind == 4 && tabuIter < tabuBeamMode[a]) ||
-            (kind == 5 && (tabuIter < tabuUntil[a] ||
-                           (cc >= 0 && tabuIter < tabuUntil[cc]))))
-            g_aspire++;
+        count_aspiration(kind, a, cc);
+        apply_move(kind, a, bb, cc);
 
-        if (kind == 1)                            // 插入
-        {
-            add_task(a, bb);
-            moveFreq[a]++;
-            tabuUntil[a] = tabuIter + tabu_tenure();
-            g_applyInsert++;
-        }
-        else if (kind == 2)                       // 纯移除
-        {
-            remove_task(a);
-            moveFreq[a]++;
-            tabuUntil[a] = tabuIter + tabu_tenure();
-            g_applyRemove++;
-        }
-        else if (kind == 3)                       // 交换：a 加入、cc 移出
-        {
-            remove_task(cc);
-            add_task(a, bb);
-            moveFreq[a]++; moveFreq[cc]++;
-            tabuUntil[a]  = tabuIter + tabu_tenure();
-            tabuUntil[cc] = tabuIter + tabu_tenure();
-            g_applySwap++;
-        }
-        else if (kind == 4)                       // 把波束 a 的模式翻转为 bb
-        {
-            int tenure = tabu_tenure();
-            apply_mode_flip(a, bb, tenure);
-            tabuBeamMode[a] = tabuIter + tenure;
-            g_applyFlip++;
-            g_flipApplied++;
-            if (bb >= 0 && bb < 16) g_flipApplyToMode[bb]++;
-        }
-        else if (kind == 5)                       // 带虚拟空位的跨波束交换
-        {
-            int b1 = taskBeam[a];
-            if (cc < 0)                           // 实任务-虚拟空位：把 a 重定位到 bb
-            {
-                remove_task(a);
-                add_task(a, bb);
-                moveFreq[a]++;
-                tabuUntil[a] = tabuIter + tabu_tenure();
-                g_crossRelocApplied++;
-            }
-            else                                  // 实任务-实任务：交换 a 和 cc
-            {
-                int b2 = taskBeam[cc];
-                remove_task(a);
-                remove_task(cc);
-                add_task(a, b2);
-                add_task(cc, b1);
-                moveFreq[a]++; moveFreq[cc]++;
-                tabuUntil[a]  = tabuIter + tabu_tenure();
-                tabuUntil[cc] = tabuIter + tabu_tenure();
-                g_crossSwapApplied++;
-            }
-            g_applyCross++;
-        }
         if (totalProfit > bestProfit)
         {
             save_best(beginTime);
@@ -1613,18 +1648,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
         int numBest = 0;
         int kind = 0, a = -1, bb = -1, cc = -1;
 
-        for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
-        for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0)
-            {
-                int b = taskBeam[j];
-                bucketTask[bucketStart[b]++] = j;
-            }
-        for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
-        bucketStart[0] = 0;
+        rebuild_buckets();
 
         // 邻域 1：插入一个未服务任务
         for (int j = 0; j < numTask; j++)
@@ -1903,71 +1927,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             tabuIter++;
             continue;
         }
-        if ((kind == 1 && tabuIter < tabuUntil[a]) ||
-            (kind == 2 && tabuIter < tabuUntil[a]) ||
-            (kind == 3 && (tabuIter < tabuUntil[a] || tabuIter < tabuUntil[cc])) ||
-            (kind == 4 && tabuIter < tabuBeamMode[a]) ||
-            (kind == 5 && (tabuIter < tabuUntil[a] ||
-                           (cc >= 0 && tabuIter < tabuUntil[cc]))))
-            g_aspire++;
-
-        if (kind == 1)
-        {
-            add_task(a, bb);
-            moveFreq[a]++;
-            tabuUntil[a] = tabuIter + tabu_tenure();
-            g_applyInsert++;
-        }
-        else if (kind == 2)
-        {
-            remove_task(a);
-            moveFreq[a]++;
-            tabuUntil[a] = tabuIter + tabu_tenure();
-            g_applyRemove++;
-        }
-        else if (kind == 3)
-        {
-            remove_task(cc);
-            add_task(a, bb);
-            moveFreq[a]++; moveFreq[cc]++;
-            tabuUntil[a]  = tabuIter + tabu_tenure();
-            tabuUntil[cc] = tabuIter + tabu_tenure();
-            g_applySwap++;
-        }
-        else if (kind == 4)
-        {
-            int tenure = tabu_tenure();
-            apply_mode_flip(a, bb, tenure);
-            tabuBeamMode[a] = tabuIter + tenure;
-            g_applyFlip++;
-            g_flipApplied++;
-            if (bb >= 0 && bb < 16) g_flipApplyToMode[bb]++;
-        }
-        else if (kind == 5)
-        {
-            int b1 = taskBeam[a];
-            if (cc < 0)
-            {
-                remove_task(a);
-                add_task(a, bb);
-                moveFreq[a]++;
-                tabuUntil[a] = tabuIter + tabu_tenure();
-                g_crossRelocApplied++;
-            }
-            else
-            {
-                int b2 = taskBeam[cc];
-                remove_task(a);
-                remove_task(cc);
-                add_task(a, b2);
-                add_task(cc, b1);
-                moveFreq[a]++; moveFreq[cc]++;
-                tabuUntil[a]  = tabuIter + tabu_tenure();
-                tabuUntil[cc] = tabuIter + tabu_tenure();
-                g_crossSwapApplied++;
-            }
-            g_applyCross++;
-        }
+        count_aspiration(kind, a, cc);
+        apply_move(kind, a, bb, cc);
 
         total_over_parts(curOverBW, curOverPW);
         curOver = curOverBW + curOverPW;
@@ -2216,6 +2177,146 @@ void perturb(int *tmpIdx, double *tmpVal)
     delete[] order;
 }
 
+//--------------------------------------------------------------------
+// mode_polish：阶段级"模式打磨"下降，专治模式向量被冻结的问题。
+//
+// 现有 N4 翻转把收益记为 -loss（只算驱逐损失、不算翻完能回填的收益），
+// 导致模式几乎从不被局部搜索改动；模式多样性只能靠扰动随机重摇，而
+// 扰动又只碰低频波束，核心波束的模式一旦定下几乎终生不变。
+//
+// 本函数以"增益感知"的方式评价单束模式翻转：翻到 m2 时先驱逐与 m2
+// 不兼容的已服务任务（损失 loss、释放 BW/PW），再在释放出的容量上按
+// 密度贪心回填当前未服务且兼容 m2 的任务（增益 gain）；净收益
+// delta = gain - loss。评价阶段用纯算术模拟、不改动全局状态；只对全
+// 局最优的单束翻转真正提交。提交路径与模拟完全一致，故被选中的正收
+// 益翻转必然抬高 totalProfit。反复扫描直到无正收益翻转或触及扫描/
+// 时间上限。全程只走硬可行解，是纯强化步骤，绝不会降低阶段最好解。
+//
+// 仅在小规模算例启用（见 g_polishEnabled），避免拖慢已经领先的大算例。
+//--------------------------------------------------------------------
+void mode_polish(double beginTime, int *tmpIdx, double *tmpVal)
+{
+    if (!g_polishEnabled) return;
+
+    double t0 = (double)clock();
+    const int maxSweeps = 20;
+
+    for (int sweep = 0; sweep < maxSweeps; sweep++)
+    {
+        if (((double)clock() - beginTime) / CLOCKS_PER_SEC > maxRunTime) break;
+        g_polishSweeps++;
+        rebuild_buckets();
+
+        int chosenB = -1, chosenM = -1, chosenDelta = 0;  // 只取严格正收益
+
+        for (int b = 0; b < numBeam; b++)
+        {
+            if (beamMode[b] < 0) continue;
+            int oldM = beamMode[b];
+
+            for (int m2 = 0; m2 < numMode; m2++)
+            {
+                if (m2 == oldM) continue;
+                if (modeBasePower[m2] > beamPWCap[b]) continue;
+
+                // 驱逐与 m2 不兼容的已服务任务，累计损失与释放的资源
+                int loss = 0, freedBW = 0, freedPW = 0;
+                for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
+                {
+                    int j = bucketTask[idx];
+                    if (taskBeam[j] != b) continue;
+                    if (!typeCompatMode[taskType[j] - 1][m2])
+                    {
+                        loss    += taskProfit[j];
+                        freedBW += taskBWDemand[j];
+                        freedPW += taskPWDemand[j];
+                    }
+                }
+
+                // 翻转后该束可用于任务的剩余 BW/PW，须 >=0 才硬可行
+                int remBW2 = remBW[b] + freedBW;
+                int remPW2 = remPW[b] + freedPW
+                             + modeBasePower[oldM] - modeBasePower[m2];
+                if (remPW2 < 0) continue;   // 新基础功率过高，保留任务放不下
+
+                // 在释放出的容量上按密度贪心回填兼容 m2 的未服务任务
+                int nFree = 0;
+                for (int j = 0; j < numTask; j++)
+                    if (taskBeam[j] == -1 && typeCompatMode[taskType[j] - 1][m2])
+                    {
+                        tmpIdx[nFree] = j;
+                        tmpVal[nFree] = task_score(j, b, m2);
+                        nFree++;
+                    }
+                if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
+
+                int gain = 0, rb = remBW2, rp = remPW2;
+                for (int ki = 0; ki < nFree; ki++)
+                {
+                    int j = tmpIdx[ki];
+                    if (taskBWDemand[j] <= rb && taskPWDemand[j] <= rp)
+                    {
+                        rb   -= taskBWDemand[j];
+                        rp   -= taskPWDemand[j];
+                        gain += taskProfit[j];
+                    }
+                }
+
+                int delta = gain - loss;
+                if (delta > chosenDelta)
+                {
+                    chosenDelta = delta;
+                    chosenB     = b;
+                    chosenM     = m2;
+                }
+            }
+        }
+
+        if (chosenB < 0) break;   // 本轮没有正收益翻转，收敛
+
+        // 提交所选单束翻转：驱逐→改模式→贪心回填（与模拟同序同集）
+        int b = chosenB, m2 = chosenM, oldM = beamMode[b];
+        for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
+        {
+            int j = bucketTask[idx];
+            if (taskBeam[j] == b && !typeCompatMode[taskType[j] - 1][m2])
+                remove_task(j);
+        }
+        beamMode[b] = m2;
+        remPW[b]   += modeBasePower[oldM] - modeBasePower[m2];
+
+        int nFree = 0;
+        for (int j = 0; j < numTask; j++)
+            if (taskBeam[j] == -1 && typeCompatMode[taskType[j] - 1][m2])
+            {
+                tmpIdx[nFree] = j;
+                tmpVal[nFree] = task_score(j, b, m2);
+                nFree++;
+            }
+        if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
+        for (int ki = 0; ki < nFree; ki++)
+        {
+            int j = tmpIdx[ki];
+            if (feasible_on(j, b)) add_task(j, b);
+        }
+
+        if (totalProfit > bestProfit)
+        {
+            save_best(beginTime);
+            g_polishApplied++;
+            g_polishGain += chosenDelta;
+        }
+        else
+        {
+            // 兜底：万一模拟与提交口径不一致，回滚到阶段最好解并退出
+            restore_best();
+            break;
+        }
+    }
+
+    g_polishTime += ((double)clock() - t0) / CLOCKS_PER_SEC;
+}
+
 void ils()
 {
     double beginTime = (double)clock();
@@ -2235,6 +2336,10 @@ void ils()
 
     globalProfit = -1;
 
+    // 模式打磨仅在小规模算例启用：这些算例上 Gurobi 常能证到近最优、
+    // 我们却因模式冻结差最后一点；大算例我们已大幅领先，关掉以护吞吐。
+    g_polishEnabled = ((long long)numBeam * numTask <= 60000);
+
     probe_modes("after_greedy");
 
     double runTime = 0.0;
@@ -2247,7 +2352,8 @@ void ils()
         local_search(beginTime, tmpIdx, tmpVal);
         restore_best();                // 混合搜索从最好可行点开始
         local_search_mixed(beginTime, tmpIdx, tmpVal);
-        restore_best();                // 扰动和全局更新接收可行解
+        // local_search_mixed 末尾已 restore_best，此处不再重复
+        mode_polish(beginTime, tmpIdx, tmpVal);   // 阶段级增益感知模式打磨
         numPhase++;
 
         if (numPhase == 1) probe_modes("after_LS1");
@@ -2337,6 +2443,11 @@ void ils()
     for (int m = 0; m < numMode && m < 16; m++)
         cout << " " << modeName[m] << "=" << g_flipApplyToMode[m];
     cout << endl;
+    cout << "[PROFILE] mode_polish enabled=" << g_polishEnabled
+         << " sweeps=" << g_polishSweeps
+         << " applied=" << g_polishApplied
+         << " gain=" << g_polishGain
+         << " time=" << g_polishTime << "s" << endl;
 
 }
 
