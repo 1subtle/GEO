@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <iostream>
 #include <fstream>
+#include <utility>
+#include <vector>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +45,49 @@ int  totalProfit;
 double maxRunTime;   // 时间上限，单位为秒
 double bestTime;     // 找到当前阶段最好解时的运行时间
 int    seed;         // 随机种子
+
+// ---- Ablation modes ------------------------------------------------
+// full:     complete ISOS algorithm
+// no-is:    skip the mixed feasible/infeasible search phase
+// no-ec:    disable orphan/ejection-chain search in both search phases
+// fixed-is: keep infeasible search, but freeze penalty weights and overload radii
+enum AblationMode
+{
+    ABL_FULL,
+    ABL_NO_IS,
+    ABL_NO_EC,
+    ABL_FIXED_IS
+};
+
+AblationMode g_ablationMode = ABL_FULL;
+
+const char *ablation_mode_name()
+{
+    if (g_ablationMode == ABL_NO_IS) return "no-is";
+    if (g_ablationMode == ABL_NO_EC) return "no-ec";
+    if (g_ablationMode == ABL_FIXED_IS) return "fixed-is";
+    return "full";
+}
+
+int set_ablation_mode(const char *name)
+{
+    if (strcmp(name, "full") == 0) g_ablationMode = ABL_FULL;
+    else if (strcmp(name, "no-is") == 0) g_ablationMode = ABL_NO_IS;
+    else if (strcmp(name, "no-ec") == 0) g_ablationMode = ABL_NO_EC;
+    else if (strcmp(name, "fixed-is") == 0) g_ablationMode = ABL_FIXED_IS;
+    else return 0;
+    return 1;
+}
+
+int ejection_chain_enabled()
+{
+    return g_ablationMode != ABL_NO_EC;
+}
+
+int adaptive_is_enabled()
+{
+    return g_ablationMode != ABL_FIXED_IS;
+}
 
 int *bestBeamMode;   // 当前 ILS 阶段最好解的模式快照
 int *bestTaskBeam;
@@ -107,13 +153,6 @@ long long g_flipCand    = 0; // 已评价的可行模式翻转候选数
 long long g_flipApplied = 0; // 已执行的模式翻转动作数
 long long g_flipApplyToMode[16] = {0}; // 按目标模式统计已执行翻转数
 
-// ---- 阶段级"模式打磨"下降（增益感知的复合模式翻转）统计 ----
-int       g_polishEnabled = 0;   // 是否启用（按算例规模开关，保护大算例吞吐）
-long long g_polishSweeps  = 0;   // 打磨扫描总次数
-long long g_polishApplied = 0;   // 已提交的正收益单束翻转数
-long long g_polishGain    = 0;   // 打磨累计净收益
-double    g_polishTime    = 0.0; // 打磨累计 CPU 时间
-
 // ---- 可行域/不可行域混合搜索状态 -----------------------
 double mixedPhiBW = 1000.0;   // 归一化 BW 超载的惩罚权重
 double mixedPhiPW = 1000.0;   // 归一化 PW 超载的惩罚权重
@@ -143,24 +182,24 @@ int find_mode_index(const char *name)
     return -1;
 }
 
-void qsort_desc(double *val, int *idx, int l, int r)
+void sort_desc(double *val, int *idx, int count)
 {
-    if (l < r)
+    size_t n = static_cast<size_t>(count);
+    vector<pair<double, int> > items(n);
+    for (size_t i = 0; i < n; i++)
+        items[i] = make_pair(val[i], idx[i]);
+
+    sort(items.begin(), items.end(),
+         [](const pair<double, int> &lhs, const pair<double, int> &rhs)
     {
-        int    i = l, j = r;
-        double xv = val[l];
-        int    xi = idx[l];
-        while (i < j)
-        {
-            while (i < j && val[j] <= xv) j--;
-            if (i < j) { val[i] = val[j]; idx[i] = idx[j]; i++; }
-            while (i < j && val[i] > xv)  i++;
-            if (i < j) { val[j] = val[i]; idx[j] = idx[i]; j--; }
-        }
-        val[i] = xv;
-        idx[i] = xi;
-        qsort_desc(val, idx, l, i - 1);
-        qsort_desc(val, idx, i + 1, r);
+        if (lhs.first != rhs.first) return lhs.first > rhs.first;
+        return lhs.second < rhs.second;
+    });
+
+    for (size_t i = 0; i < n; i++)
+    {
+        val[i] = items[i].first;
+        idx[i] = items[i].second;
     }
 }
 
@@ -176,9 +215,8 @@ void read_instance()
 
     // 文件头示例：B=5 N=50 M=3 Cbw=1578 Cpw=503
     FIC.getline(g_line, MAXLINE);
-    int cbw_total, cpw_total;
-    sscanf(g_line, "B=%d N=%d M=%d Cbw=%d Cpw=%d",
-           &numBeam, &numTask, &numMode, &cbw_total, &cpw_total);
+    sscanf(g_line, "B=%d N=%d M=%d Cbw=%*d Cpw=%*d",
+           &numBeam, &numTask, &numMode);
 
     modeName     = new char *[numMode];
     for (int m = 0; m < numMode; m++)
@@ -376,7 +414,7 @@ void greedy_init()
                     tmpVal[nFree] = task_score(j, b, m);
                     nFree++;
                 }
-            if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
+            if (nFree > 0) sort_desc(tmpVal, tmpIdx, nFree);
 
             int rem_bw = beamBWCap[b];
             int rem_pw = beamPWCap[b] - modeBasePower[m];
@@ -485,22 +523,6 @@ double beam_pw_over_with_rem(int b, int pwFree)
     return beam_pw_over_with_rem_mode(b, beamMode[b], pwFree);
 }
 
-double beam_over_with_rem_mode(int b, int m, int bwFree, int pwFree)
-{
-    return beam_bw_over_with_rem(b, bwFree) +
-           beam_pw_over_with_rem_mode(b, m, pwFree);
-}
-
-double beam_over_with_rem(int b, int bwFree, int pwFree)
-{
-    return beam_over_with_rem_mode(b, beamMode[b], bwFree, pwFree);
-}
-
-double beam_over(int b)
-{
-    return beam_over_with_rem(b, remBW[b], remPW[b]);
-}
-
 double beam_bw_over(int b)
 {
     return beam_bw_over_with_rem(b, remBW[b]);
@@ -509,14 +531,6 @@ double beam_bw_over(int b)
 double beam_pw_over(int b)
 {
     return beam_pw_over_with_rem(b, remPW[b]);
-}
-
-double total_over()
-{
-    double over = 0.0;
-    for (int b = 0; b < numBeam; b++)
-        if (beamMode[b] >= 0) over += beam_over(b);
-    return over;
 }
 
 void total_over_parts(double &bwOver, double &pwOver)
@@ -563,6 +577,13 @@ double current_resource_tightness()
 
 void set_mixed_rho_from_instance()
 {
+    if (!adaptive_is_enabled())
+    {
+        if (mixedRhoBW > g_mixedMaxRhoBW) g_mixedMaxRhoBW = mixedRhoBW;
+        if (mixedRhoPW > g_mixedMaxRhoPW) g_mixedMaxRhoPW = mixedRhoPW;
+        return;
+    }
+
     double density = numBeam > 0 ? (double)numTask / numBeam : 0.0;
     double densityAdj = (density - 10.0) * 0.004;
     densityAdj = clamp_double(densityAdj, 0.0, 0.08);
@@ -586,6 +607,8 @@ void set_mixed_rho_from_instance()
 
 void expand_mixed_rho()
 {
+    if (!adaptive_is_enabled()) return;
+
     double oldBW = mixedRhoBW;
     double oldPW = mixedRhoPW;
     mixedRhoBW = clamp_double(mixedRhoBW * 1.10 + 0.01,
@@ -599,6 +622,8 @@ void expand_mixed_rho()
 
 void shrink_mixed_rho()
 {
+    if (!adaptive_is_enabled()) return;
+
     double oldBW = mixedRhoBW;
     double oldPW = mixedRhoPW;
     mixedRhoBW = clamp_double(mixedRhoBW * 0.85,
@@ -827,8 +852,7 @@ void record_candidate(int kind, int a, int b, int c, int delta,
 }
 
 void record_mixed_candidate(int kind, int a, int b, int c,
-                            int deltaProfit, double deltaEval,
-                            double &bestDeltaEval, int &bestDeltaProfit,
+                            double deltaEval, double &bestDeltaEval,
                             int &numBest,
                             int &chosenKind, int &chosenA,
                             int &chosenB, int &chosenC)
@@ -838,7 +862,6 @@ void record_mixed_candidate(int kind, int a, int b, int c,
     if (deltaEval > bestDeltaEval)
     {
         bestDeltaEval  = deltaEval;
-        bestDeltaProfit = deltaProfit;
         numBest = 1;
         chosenKind = kind;
         chosenA    = a;
@@ -850,7 +873,6 @@ void record_mixed_candidate(int kind, int a, int b, int c,
     numBest++;
     if (rand() % numBest == 0)
     {
-        bestDeltaProfit = deltaProfit;
         chosenKind = kind;
         chosenA    = a;
         chosenB    = b;
@@ -1236,11 +1258,8 @@ void apply_move(int kind, int a, int bb, int cc)
 }
 
 //--------------------------------------------------------------------
-void local_search(double beginTime, int *tmpIdx, double *tmpVal)
+void local_search(double beginTime)
 {
-    (void)tmpIdx;
-    (void)tmpVal;
-
     int ts_depth = 300;              // 连续无改进达到该次数后结束阶段并触发扰动
     int nonImprove = 0;
     int thresholdDelta = threshold_delta();
@@ -1397,13 +1416,16 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         int fallbackDelta = bestDelta;
         if (!haveFallback || bestDelta <= 0)
         {
-            g_orphanCalls++;
-            if (orphan_search(0))
+            if (ejection_chain_enabled())
             {
-                useOrphan = 1;
-                numBest = 1;
+                g_orphanCalls++;
+                if (orphan_search(0))
+                {
+                    useOrphan = 1;
+                    numBest = 1;
+                }
             }
-            else
+            if (!useOrphan)
             {
                 // 重新从动态阈值开始记录 Cross，不能让保留的负动作
                 // 遮蔽收益为 0 的重定位或交换。
@@ -1557,11 +1579,8 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
 // BW/PW 容量约束可在小范围内放宽；模式兼容和每个任务至多分配给一个
 // 波束仍是硬约束。当前解可以不可行，但只有可行解能够更新 bestProfit。
 //--------------------------------------------------------------------
-void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
+void local_search_mixed(double beginTime)
 {
-    (void)tmpIdx;
-    (void)tmpVal;
-
     const double EPS = 1e-12;
     const int mixedDepth = 300;
     const int phiWindow = 5;
@@ -1597,54 +1616,56 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             g_mixedInfeas++;
         }
 
-        if (curOverBW <= EPS)
+        if (adaptive_is_enabled())
         {
-            bwFeasibleStreak++;
-            bwInfeasibleStreak = 0;
-            if (bwFeasibleStreak >= phiWindow)
+            if (curOverBW <= EPS)
             {
-                mixedPhiBW /= phiTau;
-                if (mixedPhiBW < phiMin) mixedPhiBW = phiMin;
-                bwFeasibleStreak = 0;
-            }
-        }
-        else
-        {
-            bwInfeasibleStreak++;
-            bwFeasibleStreak = 0;
-            if (bwInfeasibleStreak >= phiWindow)
-            {
-                mixedPhiBW *= phiTau;
-                if (mixedPhiBW > phiMax) mixedPhiBW = phiMax;
+                bwFeasibleStreak++;
                 bwInfeasibleStreak = 0;
+                if (bwFeasibleStreak >= phiWindow)
+                {
+                    mixedPhiBW /= phiTau;
+                    if (mixedPhiBW < phiMin) mixedPhiBW = phiMin;
+                    bwFeasibleStreak = 0;
+                }
             }
-        }
+            else
+            {
+                bwInfeasibleStreak++;
+                bwFeasibleStreak = 0;
+                if (bwInfeasibleStreak >= phiWindow)
+                {
+                    mixedPhiBW *= phiTau;
+                    if (mixedPhiBW > phiMax) mixedPhiBW = phiMax;
+                    bwInfeasibleStreak = 0;
+                }
+            }
 
-        if (curOverPW <= EPS)
-        {
-            pwFeasibleStreak++;
-            pwInfeasibleStreak = 0;
-            if (pwFeasibleStreak >= phiWindow)
+            if (curOverPW <= EPS)
             {
-                mixedPhiPW /= phiTau;
-                if (mixedPhiPW < phiMin) mixedPhiPW = phiMin;
-                pwFeasibleStreak = 0;
-            }
-        }
-        else
-        {
-            pwInfeasibleStreak++;
-            pwFeasibleStreak = 0;
-            if (pwInfeasibleStreak >= phiWindow)
-            {
-                mixedPhiPW *= phiTau;
-                if (mixedPhiPW > phiMax) mixedPhiPW = phiMax;
+                pwFeasibleStreak++;
                 pwInfeasibleStreak = 0;
+                if (pwFeasibleStreak >= phiWindow)
+                {
+                    mixedPhiPW /= phiTau;
+                    if (mixedPhiPW < phiMin) mixedPhiPW = phiMin;
+                    pwFeasibleStreak = 0;
+                }
+            }
+            else
+            {
+                pwInfeasibleStreak++;
+                pwFeasibleStreak = 0;
+                if (pwInfeasibleStreak >= phiWindow)
+                {
+                    mixedPhiPW *= phiTau;
+                    if (mixedPhiPW > phiMax) mixedPhiPW = phiMax;
+                    pwInfeasibleStreak = 0;
+                }
             }
         }
 
         double bestDeltaEval = -1.0e100;
-        int bestDeltaProfit = MININT_MOVE;
         int numBest = 0;
         int kind = 0, a = -1, bb = -1, cc = -1;
 
@@ -1678,8 +1699,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 double deltaEval = (double)deltaProfit
                     - mixedPhiBW * (newOverBW - curOverBW)
                     - mixedPhiPW * (newOverPW - curOverPW);
-                record_mixed_candidate(1, j, b, -1, deltaProfit, deltaEval,
-                                       bestDeltaEval, bestDeltaProfit, numBest,
+                record_mixed_candidate(1, j, b, -1, deltaEval,
+                                       bestDeltaEval, numBest,
                                        kind, a, bb, cc);
             }
         }
@@ -1706,8 +1727,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             double deltaEval = (double)deltaProfit
                 - mixedPhiBW * (newOverBW - curOverBW)
                 - mixedPhiPW * (newOverPW - curOverPW);
-            record_mixed_candidate(2, j, -1, -1, deltaProfit, deltaEval,
-                                   bestDeltaEval, bestDeltaProfit, numBest,
+            record_mixed_candidate(2, j, -1, -1, deltaEval,
+                                   bestDeltaEval, numBest,
                                    kind, a, bb, cc);
         }
 
@@ -1742,8 +1763,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     double deltaEval = (double)deltaProfit
                         - mixedPhiBW * (newOverBW - curOverBW)
                         - mixedPhiPW * (newOverPW - curOverPW);
-                    record_mixed_candidate(3, i, b, k, deltaProfit, deltaEval,
-                                           bestDeltaEval, bestDeltaProfit, numBest,
+                    record_mixed_candidate(3, i, b, k, deltaEval,
+                                           bestDeltaEval, numBest,
                                            kind, a, bb, cc);
                 }
             }
@@ -1790,8 +1811,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 double deltaEval = (double)deltaProfit
                     - mixedPhiBW * (newOverBW - curOverBW)
                     - mixedPhiPW * (newOverPW - curOverPW);
-                record_mixed_candidate(4, b, m2, -1, deltaProfit, deltaEval,
-                                       bestDeltaEval, bestDeltaProfit, numBest,
+                record_mixed_candidate(4, b, m2, -1, deltaEval,
+                                       bestDeltaEval, numBest,
                                        kind, a, bb, cc);
             }
         }
@@ -1799,7 +1820,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
         // 混合阶段同样先比较 N1--N4；只有它们没有正 deltaEval 时，
         // 才先试孤儿链，失败后再回退到 Cross。
         int useOrphan = 0;
-        if (bestDeltaEval <= EPS)
+        if (bestDeltaEval <= EPS && ejection_chain_enabled())
         {
             g_orphanCalls++;
             if (orphan_search(1)) useOrphan = 1;
@@ -1847,8 +1868,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                                        -mixedPhiPW * (newOverPW - curOverPW);
                     g_crossCand++;
                     g_crossRelocCand++;
-                    record_mixed_candidate(5, i, b2, -1, 0, deltaEval,
-                                           bestDeltaEval, bestDeltaProfit, numBest,
+                    record_mixed_candidate(5, i, b2, -1, deltaEval,
+                                           bestDeltaEval, numBest,
                                            kind, a, bb, cc);
                 }
 
@@ -1886,8 +1907,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                                        -mixedPhiPW * (newOverPW - curOverPW);
                     g_crossCand++;
                     g_crossSwapCand++;
-                    record_mixed_candidate(5, i, b2, k, 0, deltaEval,
-                                           bestDeltaEval, bestDeltaProfit, numBest,
+                    record_mixed_candidate(5, i, b2, k, deltaEval,
+                                           bestDeltaEval, numBest,
                                            kind, a, bb, cc);
                 }
             }
@@ -1960,7 +1981,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
 //
 // 从当前阶段最好解出发：
 //
-//  破坏：选择 30% 的波束，移除其全部任务并放回未服务任务池，同时把
+//  破坏：选择 60% 的波束，移除其全部任务并放回未服务任务池，同时把
 //  模式重置为 -1，形成部分解；未选中的波束保留模式和任务分配。
 //
 //  模式修复：依次为被清空波束重新选择模式。对一个波束枚举功率可行
@@ -1969,32 +1990,31 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
 //  波束前先提交当前模式和任务，防止模式选择时重复计算任务。
 //
 //  任务修复：按现有最高可达优先级排序，对仍未服务任务进行贪心回填。
-//  每个任务先尝试基础功率较低的兼容波束模式；在同一模式层内使用原有
-//  的最紧带宽适配规则。
+//  对每个任务枚举所有可行波束，最小化归一化剩余带宽与剩余功率之和；
+//  若适配值相同，则依次优先剩余功率、剩余带宽更小的波束。
 //--------------------------------------------------------------------
 void perturb(int *tmpIdx, double *tmpVal)
 {
     restore_best();
     if (numBeam == 0) return;
 
-    // 破坏：清空 30% 的波束，优先选择上次局部搜索中已服务任务移动次数
+    // 破坏：清空 60% 的波束，优先选择上次局部搜索中已服务任务移动次数
     // 较少的波束，推动搜索进入尚未充分探索的区域
-    int numDestroy = (int)(0.30 * numBeam + 0.5);
+    int numDestroy = (int)(0.60 * numBeam + 0.5);
     if (numDestroy < 1)        numDestroy = 1;
     if (numDestroy > numBeam)  numDestroy = numBeam;
 
     // 波束频率键等于该波束已服务任务 moveFreq 之和
     int    *perturbBeam = new int[numBeam];      // 临时保存待清空波束
-    int    *prevMode    = new int[numBeam];      // 保存各清空波束破坏前的模式
     double *beamFreqKey = new double[numBeam];
     int    *order       = new int[numBeam];
     for (int b = 0; b < numBeam; b++) { beamFreqKey[b] = 0.0; order[b] = b; }
     for (int j = 0; j < numTask; j++)
         if (taskBeam[j] >= 0) beamFreqKey[taskBeam[j]] += moveFreq[j];
 
-    // 对频率键取负后使用 qsort_desc，实现按频率升序排列
+    // 对频率键取负后降序排列，实现按频率升序排列
     for (int b = 0; b < numBeam; b++) beamFreqKey[b] = -beamFreqKey[b];
-    qsort_desc(beamFreqKey, order, 0, numBeam - 1);   // order[] 中低频波束在前
+    sort_desc(beamFreqKey, order, numBeam);           // order[] 中低频波束在前
 
     // 从低移动频率波束池抽取，候选池至少包含 numDestroy 个波束
     int poolSize = 0;
@@ -2012,7 +2032,6 @@ void perturb(int *tmpIdx, double *tmpVal)
     for (int k = 0; k < numDestroy; k++)
     {
         int b = perturbBeam[k];
-        prevMode[k] = beamMode[b];                  // 保存旧模式，修复时允许重新选择
         for (int j = 0; j < numTask; j++)
             if (taskBeam[j] == b) remove_task(j);
         beamMode[b] = -1;
@@ -2051,7 +2070,7 @@ void perturb(int *tmpIdx, double *tmpVal)
                     tmpVal[nFree] = task_priority(j);
                     nFree++;
                 }
-            if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
+            if (nFree > 0) sort_desc(tmpVal, tmpIdx, nFree);
 
             int nTrialAdded = 0;
             for (int ki = 0; ki < nFree; ki++)
@@ -2093,7 +2112,6 @@ void perturb(int *tmpIdx, double *tmpVal)
             {
                 if (bestM < 0 || modeBasePower[m] < modeBasePower[bestM]) bestM = m;
             }
-            if (bestM < 0) bestM = prevMode[k];   // 只有一个模式时无法规避
         }
 
         int chosenM      = bestM;
@@ -2127,194 +2145,52 @@ void perturb(int *tmpIdx, double *tmpVal)
             tmpVal[nFree] = task_priority(j);
             nFree++;
         }
-    if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
+    if (nFree > 0) sort_desc(tmpVal, tmpIdx, nFree);
 
-    int *modeOrder = new int[numMode];
+    const double FIT_EPS = 1e-12;
     for (int k = 0; k < nFree; k++)
     {
         int j = tmpIdx[k];
 
-        int bestBeam   = -1;
-        int bestLeftBW = -1;
+        int bestBeam = -1;
+        double bestFit = 1.0e100;
+        double bestLeftPW = 1.0e100;
+        double bestLeftBW = 1.0e100;
 
-        int t = taskType[j] - 1;
-        int numCompatMode = 0;
-        for (int m = 0; m < numMode; m++)
+        for (int b = 0; b < numBeam; b++)
         {
-            if (!typeCompatMode[t][m]) continue;
+            if (!feasible_on(j, b)) continue;
 
-            int pos = numCompatMode;
-            while (pos > 0 && modeBasePower[m] < modeBasePower[modeOrder[pos - 1]])
+            int bwCap = beamBWCap[b];
+            int pwCap = beamPWCap[b] - modeBasePower[beamMode[b]];
+            if (bwCap < 1) bwCap = 1;
+            if (pwCap < 1) pwCap = 1;
+
+            double leftBW = (double)(remBW[b] - taskBWDemand[j]) / bwCap;
+            double leftPW = (double)(remPW[b] - taskPWDemand[j]) / pwCap;
+            double fit = leftBW + leftPW;
+
+            int better = (bestBeam < 0 || fit < bestFit - FIT_EPS);
+            if (!better && fit <= bestFit + FIT_EPS)
             {
-                modeOrder[pos] = modeOrder[pos - 1];
-                pos--;
+                better = leftPW < bestLeftPW - FIT_EPS ||
+                    (leftPW <= bestLeftPW + FIT_EPS &&
+                     leftBW < bestLeftBW - FIT_EPS);
             }
-            modeOrder[pos] = m;
-            numCompatMode++;
-        }
 
-        for (int km = 0; km < numCompatMode && bestBeam < 0; km++)
-        {
-            int m = modeOrder[km];
-            for (int b = 0; b < numBeam; b++)
+            if (better)
             {
-                if (beamMode[b] != m) continue;
-                if (!feasible_on(j, b)) continue;
-                int leftover = remBW[b] - taskBWDemand[j];
-                if (bestBeam < 0 || leftover < bestLeftBW)
-                {
-                    bestBeam   = b;
-                    bestLeftBW = leftover;
-                }
+                bestBeam   = b;
+                bestFit    = fit;
+                bestLeftPW = leftPW;
+                bestLeftBW = leftBW;
             }
         }
         if (bestBeam >= 0) add_task(j, bestBeam);
     }
-    delete[] modeOrder;
     delete[] perturbBeam;
-    delete[] prevMode;
     delete[] beamFreqKey;
     delete[] order;
-}
-
-//--------------------------------------------------------------------
-// mode_polish：阶段级"模式打磨"下降，专治模式向量被冻结的问题。
-//
-// 现有 N4 翻转把收益记为 -loss（只算驱逐损失、不算翻完能回填的收益），
-// 导致模式几乎从不被局部搜索改动；模式多样性只能靠扰动随机重摇，而
-// 扰动又只碰低频波束，核心波束的模式一旦定下几乎终生不变。
-//
-// 本函数以"增益感知"的方式评价单束模式翻转：翻到 m2 时先驱逐与 m2
-// 不兼容的已服务任务（损失 loss、释放 BW/PW），再在释放出的容量上按
-// 密度贪心回填当前未服务且兼容 m2 的任务（增益 gain）；净收益
-// delta = gain - loss。评价阶段用纯算术模拟、不改动全局状态；只对全
-// 局最优的单束翻转真正提交。提交路径与模拟完全一致，故被选中的正收
-// 益翻转必然抬高 totalProfit。反复扫描直到无正收益翻转或触及扫描/
-// 时间上限。全程只走硬可行解，是纯强化步骤，绝不会降低阶段最好解。
-//
-// 仅在小规模算例启用（见 g_polishEnabled），避免拖慢已经领先的大算例。
-//--------------------------------------------------------------------
-void mode_polish(double beginTime, int *tmpIdx, double *tmpVal)
-{
-    if (!g_polishEnabled) return;
-
-    double t0 = (double)clock();
-    const int maxSweeps = 20;
-
-    for (int sweep = 0; sweep < maxSweeps; sweep++)
-    {
-        if (((double)clock() - beginTime) / CLOCKS_PER_SEC > maxRunTime) break;
-        g_polishSweeps++;
-        rebuild_buckets();
-
-        int chosenB = -1, chosenM = -1, chosenDelta = 0;  // 只取严格正收益
-
-        for (int b = 0; b < numBeam; b++)
-        {
-            if (beamMode[b] < 0) continue;
-            int oldM = beamMode[b];
-
-            for (int m2 = 0; m2 < numMode; m2++)
-            {
-                if (m2 == oldM) continue;
-                if (modeBasePower[m2] > beamPWCap[b]) continue;
-
-                // 驱逐与 m2 不兼容的已服务任务，累计损失与释放的资源
-                int loss = 0, freedBW = 0, freedPW = 0;
-                for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
-                {
-                    int j = bucketTask[idx];
-                    if (taskBeam[j] != b) continue;
-                    if (!typeCompatMode[taskType[j] - 1][m2])
-                    {
-                        loss    += taskProfit[j];
-                        freedBW += taskBWDemand[j];
-                        freedPW += taskPWDemand[j];
-                    }
-                }
-
-                // 翻转后该束可用于任务的剩余 BW/PW，须 >=0 才硬可行
-                int remBW2 = remBW[b] + freedBW;
-                int remPW2 = remPW[b] + freedPW
-                             + modeBasePower[oldM] - modeBasePower[m2];
-                if (remPW2 < 0) continue;   // 新基础功率过高，保留任务放不下
-
-                // 在释放出的容量上按密度贪心回填兼容 m2 的未服务任务
-                int nFree = 0;
-                for (int j = 0; j < numTask; j++)
-                    if (taskBeam[j] == -1 && typeCompatMode[taskType[j] - 1][m2])
-                    {
-                        tmpIdx[nFree] = j;
-                        tmpVal[nFree] = task_score(j, b, m2);
-                        nFree++;
-                    }
-                if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
-
-                int gain = 0, rb = remBW2, rp = remPW2;
-                for (int ki = 0; ki < nFree; ki++)
-                {
-                    int j = tmpIdx[ki];
-                    if (taskBWDemand[j] <= rb && taskPWDemand[j] <= rp)
-                    {
-                        rb   -= taskBWDemand[j];
-                        rp   -= taskPWDemand[j];
-                        gain += taskProfit[j];
-                    }
-                }
-
-                int delta = gain - loss;
-                if (delta > chosenDelta)
-                {
-                    chosenDelta = delta;
-                    chosenB     = b;
-                    chosenM     = m2;
-                }
-            }
-        }
-
-        if (chosenB < 0) break;   // 本轮没有正收益翻转，收敛
-
-        // 提交所选单束翻转：驱逐→改模式→贪心回填（与模拟同序同集）
-        int b = chosenB, m2 = chosenM, oldM = beamMode[b];
-        for (int idx = bucketStart[b]; idx < bucketStart[b + 1]; idx++)
-        {
-            int j = bucketTask[idx];
-            if (taskBeam[j] == b && !typeCompatMode[taskType[j] - 1][m2])
-                remove_task(j);
-        }
-        beamMode[b] = m2;
-        remPW[b]   += modeBasePower[oldM] - modeBasePower[m2];
-
-        int nFree = 0;
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] == -1 && typeCompatMode[taskType[j] - 1][m2])
-            {
-                tmpIdx[nFree] = j;
-                tmpVal[nFree] = task_score(j, b, m2);
-                nFree++;
-            }
-        if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
-        for (int ki = 0; ki < nFree; ki++)
-        {
-            int j = tmpIdx[ki];
-            if (feasible_on(j, b)) add_task(j, b);
-        }
-
-        if (totalProfit > bestProfit)
-        {
-            save_best(beginTime);
-            g_polishApplied++;
-            g_polishGain += chosenDelta;
-        }
-        else
-        {
-            // 兜底：万一模拟与提交口径不一致，回滚到阶段最好解并退出
-            restore_best();
-            break;
-        }
-    }
-
-    g_polishTime += ((double)clock() - t0) / CLOCKS_PER_SEC;
 }
 
 void ils()
@@ -2336,10 +2212,6 @@ void ils()
 
     globalProfit = -1;
 
-    // 模式打磨仅在小规模算例启用：这些算例上 Gurobi 常能证到近最优、
-    // 我们却因模式冻结差最后一点；大算例我们已大幅领先，关掉以护吞吐。
-    g_polishEnabled = ((long long)numBeam * numTask <= 60000);
-
     probe_modes("after_greedy");
 
     double runTime = 0.0;
@@ -2349,11 +2221,13 @@ void ils()
         for (int j = 0; j < numTask; j++) moveFreq[j] = 0;
 
         save_best(beginTime);          // 当前解作为本阶段最好解的起点
-        local_search(beginTime, tmpIdx, tmpVal);
-        restore_best();                // 混合搜索从最好可行点开始
-        local_search_mixed(beginTime, tmpIdx, tmpVal);
-        // local_search_mixed 末尾已 restore_best，此处不再重复
-        mode_polish(beginTime, tmpIdx, tmpVal);   // 阶段级增益感知模式打磨
+        local_search(beginTime);
+        restore_best();
+        if (g_ablationMode != ABL_NO_IS)
+        {
+            // 混合搜索从最好可行点开始；末尾会再次 restore_best。
+            local_search_mixed(beginTime);
+        }
         numPhase++;
 
         if (numPhase == 1) probe_modes("after_LS1");
@@ -2443,12 +2317,6 @@ void ils()
     for (int m = 0; m < numMode && m < 16; m++)
         cout << " " << modeName[m] << "=" << g_flipApplyToMode[m];
     cout << endl;
-    cout << "[PROFILE] mode_polish enabled=" << g_polishEnabled
-         << " sweeps=" << g_polishSweeps
-         << " applied=" << g_polishApplied
-         << " gain=" << g_polishGain
-         << " time=" << g_polishTime << "s" << endl;
-
 }
 
 //--------------------------------------------------------------------
@@ -2596,9 +2464,11 @@ void free_memory()
 //--------------------------------------------------------------------
 int main(int argc, char **argv)
 {
-    if (argc < 3)
+    if (argc < 3 || argc > 5)
     {
-        cout << "Usage: " << argv[0] << " <instance_file> <seed> [time_limit_seconds]" << endl;
+        cout << "Usage: " << argv[0]
+             << " <instance_file> <seed> [time_limit_seconds]"
+             << " [full|no-is|no-ec|fixed-is]" << endl;
         return 1;
     }
     instanceName = argv[1];
@@ -2607,6 +2477,14 @@ int main(int argc, char **argv)
 
     maxRunTime = 600.0;          // 时间上限，单位为秒
     if (argc >= 4) maxRunTime = atof(argv[3]);
+    if (argc >= 5 && !set_ablation_mode(argv[4]))
+    {
+        cout << "Unknown ablation mode: " << argv[4] << endl;
+        cout << "Available modes: full, no-is, no-ec, fixed-is" << endl;
+        return 1;
+    }
+
+    cout << "[ABLATION] mode=" << ablation_mode_name() << endl;
 
     double t0 = (double)clock();
 
