@@ -63,6 +63,8 @@ int **typeProfitSum; // typeProfitSum[b][t]：波束 b 上类型 t 的已服务�
 // 使交换邻域能够跳过无关任务。
 int *bucketTask;     // 长度 numTask：按波束连续存放的已服务任务编号
 int *bucketStart;    // 长度 numBeam+1：波束 b 的区间为 [bucketStart[b], bucketStart[b+1])
+int *mixedMinBWFree;
+int **mixedMinPWFree;
 int **insertMinPW;   // insertMinPW[m][bw]：模式 m 下、BW 不超过 bw 的未服务任务最小 PW
 int  maxBeamBWCap;
 
@@ -601,23 +603,29 @@ void shrink_mixed_rho()
     if (mixedRhoBW != oldBW || mixedRhoPW != oldPW) g_mixedRhoShrink++;
 }
 
+int max_overload_for_rho(int denom, double rho)
+{
+    if (denom < 1) denom = 1;
+    int limit = (int)(rho * denom);
+    while ((double)(limit + 1) / denom <= rho) limit++;
+    while (limit > 0 && (double)limit / denom > rho) limit--;
+    return limit;
+}
+
+void rebuild_relaxed_limits()
+{
+    for (int b = 0; b < numBeam; b++)
+    {
+        mixedMinBWFree[b] = -max_overload_for_rho(beamBWCap[b], mixedRhoBW);
+        for (int m = 0; m < numMode; m++)
+            mixedMinPWFree[b][m] =
+                -max_overload_for_rho(beamPWCap[b] - modeBasePower[m], mixedRhoPW);
+    }
+}
+
 int relaxed_rem_ok_mode(int b, int m, int bwFree, int pwFree)
 {
-    if (bwFree < 0)
-    {
-        int denom = beamBWCap[b];
-        if (denom < 1) denom = 1;
-        if ((double)(-bwFree) / denom > mixedRhoBW) return 0;
-    }
-
-    if (pwFree < 0)
-    {
-        int denom = beamPWCap[b] - modeBasePower[m];
-        if (denom < 1) denom = 1;
-        if ((double)(-pwFree) / denom > mixedRhoPW) return 0;
-    }
-
-    return 1;
+    return bwFree >= mixedMinBWFree[b] && pwFree >= mixedMinPWFree[b][m];
 }
 
 int relaxed_rem_ok(int b, int bwFree, int pwFree)
@@ -779,6 +787,9 @@ void alloc_search()
     tabuUntil    = new int[numTask];
     bucketTask   = new int[numTask];
     bucketStart  = new int[numBeam + 1];
+    mixedMinBWFree = new int[numBeam];
+    mixedMinPWFree = new int*[numBeam];
+    for (int b = 0; b < numBeam; b++) mixedMinPWFree[b] = new int[numMode];
     orphanWorkBW = new int[numBeam];
     orphanWorkPW = new int[numBeam];
     orphanTask = new int[numTask];
@@ -1565,6 +1576,10 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
     int nonImprove = 0;
     int bwFeasibleStreak = 0, bwInfeasibleStreak = 0;
     int pwFeasibleStreak = 0, pwInfeasibleStreak = 0;
+    long long localTabuBlock = 0;
+    long long localCrossCand = 0;
+    long long localCrossRelocCand = 0;
+    long long localCrossSwapCand = 0;
     double mixedStart = (double)clock();
     double curOverBW, curOverPW;
     total_over_parts(curOverBW, curOverPW);
@@ -1636,6 +1651,8 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             }
         }
 
+        rebuild_relaxed_limits();
+
         double bestDeltaEval = -1.0e100;
         int bestDeltaProfit = MININT_MOVE;
         int numBest = 0;
@@ -1665,7 +1682,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 if (tabuIter < tabuUntil[j])
                 {
                     if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* 特赦 */ }
-                    else { g_tabuBlock++; continue; }
+                    else { localTabuBlock++; continue; }
                 }
 
                 double deltaEval = (double)deltaProfit
@@ -1693,7 +1710,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             if (tabuIter < tabuUntil[j])
             {
                 if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* 特赦 */ }
-                else { g_tabuBlock++; continue; }
+                else { localTabuBlock++; continue; }
             }
 
             double deltaEval = (double)deltaProfit
@@ -1729,7 +1746,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     if (tabuIter < tabuUntil[i] || tabuIter < tabuUntil[k])
                     {
                         if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* 特赦 */ }
-                        else { g_tabuBlock++; continue; }
+                        else { localTabuBlock++; continue; }
                     }
 
                     double deltaEval = (double)deltaProfit
@@ -1776,7 +1793,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 if (tabuIter < tabuBeamMode[b] || evictTabu)
                 {
                     if (newOver <= EPS && totalProfit + deltaProfit > bestProfit) { /* 特赦 */ }
-                    else { g_tabuBlock++; continue; }
+                    else { localTabuBlock++; continue; }
                 }
 
                 g_flipCand++;
@@ -1833,13 +1850,13 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     if (tabuIter < tabuUntil[i])
                     {
                         if (newOver <= EPS && totalProfit > bestProfit) { /* 特赦 */ }
-                        else { g_tabuBlock++; continue; }
+                        else { localTabuBlock++; continue; }
                     }
 
                     double deltaEval = -mixedPhiBW * (newOverBW - curOverBW)
                                        -mixedPhiPW * (newOverPW - curOverPW);
-                    g_crossCand++;
-                    g_crossRelocCand++;
+                    localCrossCand++;
+                    localCrossRelocCand++;
                     record_mixed_candidate(5, i, b2, -1, 0, deltaEval,
                                            bestDeltaEval, bestDeltaProfit, numBest,
                                            kind, a, bb, cc);
@@ -1872,13 +1889,13 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     if (tabuIter < tabuUntil[i] || tabuIter < tabuUntil[k])
                     {
                         if (newOver <= EPS && totalProfit > bestProfit) { /* 特赦 */ }
-                        else { g_tabuBlock++; continue; }
+                        else { localTabuBlock++; continue; }
                     }
 
                     double deltaEval = -mixedPhiBW * (newOverBW - curOverBW)
                                        -mixedPhiPW * (newOverPW - curOverPW);
-                    g_crossCand++;
-                    g_crossSwapCand++;
+                    localCrossCand++;
+                    localCrossSwapCand++;
                     record_mixed_candidate(5, i, b2, k, 0, deltaEval,
                                            bestDeltaEval, bestDeltaProfit, numBest,
                                            kind, a, bb, cc);
@@ -1945,6 +1962,10 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
     }
 
     restore_best();       // 混合阶段始终向后续流程交付可行解
+    g_tabuBlock += localTabuBlock;
+    g_crossCand += localCrossCand;
+    g_crossRelocCand += localCrossRelocCand;
+    g_crossSwapCand += localCrossSwapCand;
     g_mixedTime += ((double)clock() - mixedStart) / CLOCKS_PER_SEC;
 }
 
@@ -2417,6 +2438,9 @@ void free_memory()
     delete[] tabuUntil;
     delete[] bucketTask;
     delete[] bucketStart;
+    delete[] mixedMinBWFree;
+    for (int b = 0; b < numBeam; b++) delete[] mixedMinPWFree[b];
+    delete[] mixedMinPWFree;
     delete[] orphanWorkBW;
     delete[] orphanWorkPW;
     delete[] orphanTask;
