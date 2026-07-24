@@ -65,6 +65,8 @@ int *bucketTask;     // 长度 numTask：按波束连续存放的已服务任务
 int *bucketStart;    // 长度 numBeam+1：波束 b 的区间为 [bucketStart[b], bucketStart[b+1])
 int *mixedMinBWFree;
 int **mixedMinPWFree;
+double *beamBWDenom;
+double **beamPWDenom;
 int **insertMinPW;   // insertMinPW[m][bw]：模式 m 下、BW 不超过 bw 的未服务任务最小 PW
 int  maxBeamBWCap;
 
@@ -462,17 +464,13 @@ int feasible_on(int j, int b)
 double beam_bw_over_with_rem(int b, int bwFree)
 {
     if (bwFree >= 0) return 0.0;
-    int denom = beamBWCap[b];
-    if (denom < 1) denom = 1;
-    return (double)(-bwFree) / denom;
+    return (double)(-bwFree) / beamBWDenom[b];
 }
 
 double beam_pw_over_with_rem_mode(int b, int m, int pwFree)
 {
     if (pwFree >= 0) return 0.0;
-    int denom = beamPWCap[b] - modeBasePower[m];
-    if (denom < 1) denom = 1;
-    return (double)(-pwFree) / denom;
+    return (double)(-pwFree) / beamPWDenom[b][m];
 }
 
 double beam_pw_over_with_rem(int b, int pwFree)
@@ -790,6 +788,21 @@ void alloc_search()
     mixedMinBWFree = new int[numBeam];
     mixedMinPWFree = new int*[numBeam];
     for (int b = 0; b < numBeam; b++) mixedMinPWFree[b] = new int[numMode];
+    beamBWDenom = new double[numBeam];
+    beamPWDenom = new double*[numBeam];
+    for (int b = 0; b < numBeam; b++)
+    {
+        int bwDenom = beamBWCap[b];
+        if (bwDenom < 1) bwDenom = 1;
+        beamBWDenom[b] = (double)bwDenom;
+        beamPWDenom[b] = new double[numMode];
+        for (int m = 0; m < numMode; m++)
+        {
+            int pwDenom = beamPWCap[b] - modeBasePower[m];
+            if (pwDenom < 1) pwDenom = 1;
+            beamPWDenom[b][m] = (double)pwDenom;
+        }
+    }
     orphanWorkBW = new int[numBeam];
     orphanWorkPW = new int[numBeam];
     orphanTask = new int[numTask];
@@ -1824,12 +1837,18 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             if (b1 < 0) continue;
 
             int ti = taskType[i] - 1;
+            double b1OldOverBW = beam_bw_over(b1);
+            double b1OldOverPW = beam_pw_over(b1);
             for (int b2 = 0; b2 < numBeam; b2++)
             {
                 if (b2 == b1) continue;
                 if (beamMode[b2] < 0) continue;
                 if (!typeCompatMode[ti][beamMode[b2]]) continue;
 
+                double pairBaseOverBW =
+                    curOverBW - b1OldOverBW - beam_bw_over(b2);
+                double pairBaseOverPW =
+                    curOverPW - b1OldOverPW - beam_pw_over(b2);
                 int b1BW = remBW[b1] + taskBWDemand[i];
                 int b1PW = remPW[b1] + taskPWDemand[i];
                 int b2BW = remBW[b2] - taskBWDemand[i];
@@ -1837,12 +1856,10 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                 if (relaxed_rem_ok(b1, b1BW, b1PW) &&
                     relaxed_rem_ok(b2, b2BW, b2PW))
                 {
-                    double newOverBW = curOverBW
-                        - beam_bw_over(b1) - beam_bw_over(b2)
+                    double newOverBW = pairBaseOverBW
                         + beam_bw_over_with_rem(b1, b1BW)
                         + beam_bw_over_with_rem(b2, b2BW);
-                    double newOverPW = curOverPW
-                        - beam_pw_over(b1) - beam_pw_over(b2)
+                    double newOverPW = pairBaseOverPW
                         + beam_pw_over_with_rem(b1, b1PW)
                         + beam_pw_over_with_rem(b2, b2PW);
                     double newOver = newOverBW + newOverPW;
@@ -1876,12 +1893,10 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
                     if (!relaxed_rem_ok(b1, b1BW, b1PW)) continue;
                     if (!relaxed_rem_ok(b2, b2BW, b2PW)) continue;
 
-                    double newOverBW = curOverBW
-                        - beam_bw_over(b1) - beam_bw_over(b2)
+                    double newOverBW = pairBaseOverBW
                         + beam_bw_over_with_rem(b1, b1BW)
                         + beam_bw_over_with_rem(b2, b2BW);
-                    double newOverPW = curOverPW
-                        - beam_pw_over(b1) - beam_pw_over(b2)
+                    double newOverPW = pairBaseOverPW
                         + beam_pw_over_with_rem(b1, b1PW)
                         + beam_pw_over_with_rem(b2, b2PW);
                     double newOver = newOverBW + newOverPW;
@@ -2441,6 +2456,9 @@ void free_memory()
     delete[] mixedMinBWFree;
     for (int b = 0; b < numBeam; b++) delete[] mixedMinPWFree[b];
     delete[] mixedMinPWFree;
+    delete[] beamBWDenom;
+    for (int b = 0; b < numBeam; b++) delete[] beamPWDenom[b];
+    delete[] beamPWDenom;
     delete[] orphanWorkBW;
     delete[] orphanWorkPW;
     delete[] orphanTask;
