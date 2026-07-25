@@ -625,6 +625,22 @@ int relaxed_rem_ok(int b, int bwFree, int pwFree)
     return relaxed_rem_ok_mode(b, beamMode[b], bwFree, pwFree);
 }
 
+void rebuild_task_buckets()
+{
+    for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
+    for (int j = 0; j < numTask; j++)
+        if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
+    for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
+    for (int j = 0; j < numTask; j++)
+        if (taskBeam[j] >= 0)
+        {
+            int b = taskBeam[j];
+            bucketTask[bucketStart[b]++] = j;
+        }
+    for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
+    bucketStart[0] = 0;
+}
+
 void rebuild_insert_filter()
 {
     const int INF = 1000000000;
@@ -880,17 +896,20 @@ void orphan_consider_leaf(int count, int tailDest, int relaxed)
     if (tailDest >= 0) g_orphanRelocLeaf++;
     else               g_orphanDropLeaf++;
 
-    for (int b = 0; b < numBeam; b++)
+    if (relaxed)
     {
-        int bwFree = orphanWorkBW[b];
-        int pwFree = orphanWorkPW[b];
-        if (b == tailDest)
+        for (int b = 0; b < numBeam; b++)
         {
-            bwFree -= taskBWDemand[tail];
-            pwFree -= taskPWDemand[tail];
+            int bwFree = orphanWorkBW[b];
+            int pwFree = orphanWorkPW[b];
+            if (b == tailDest)
+            {
+                bwFree -= taskBWDemand[tail];
+                pwFree -= taskPWDemand[tail];
+            }
+            newOverBW += beam_bw_over_with_rem(b, bwFree);
+            newOverPW += beam_pw_over_with_rem(b, pwFree);
         }
-        newOverBW += beam_bw_over_with_rem(b, bwFree);
-        newOverPW += beam_pw_over_with_rem(b, pwFree);
     }
 
     if (!relaxed && deltaProfit <= 0) return;
@@ -1065,7 +1084,10 @@ int orphan_search(int relaxed)
     orphanBestDeltaProfit = MININT_MOVE;
     orphanBestDeltaEval = -1.0e100;
     orphanBestAspired = 0;
-    total_over_parts(orphanBaseOverBW, orphanBaseOverPW);
+    if (relaxed)
+        total_over_parts(orphanBaseOverBW, orphanBaseOverPW);
+    else
+        orphanBaseOverBW = orphanBaseOverPW = 0.0;
     for (int j = 0; j < numTask; j++) orphanStartMark[j] = 0;
 
     for (int rank = 0; rank < ORPHAN_EC_START_CAP; rank++)
@@ -1133,6 +1155,8 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
     int ts_depth = 300;              // 连续无改进达到该次数后结束阶段并触发扰动
     int nonImprove = 0;
     int thresholdDelta = threshold_delta();
+    int bucketsDirty = 1;
+    int insertFilterDirty = 1;
     double lsStart = (double)clock();
 
     for (int j = 0; j < numTask; j++) tabuUntil[j] = 0;
@@ -1150,22 +1174,12 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         int numBest   = 0;               // 找到首个达到阈值的动作后变为 1
         int kind = 0, a = -1, bb = -1, cc = -1;
 
-        // 重建按波束分组的已服务任务 CSR 桶。
-        // 对 taskBeam 使用计数排序，每次迭代复杂度为 O(numTask + numBeam)。
-        for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
-        for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
-        // 使用每个波束的局部游标填桶，并复用 bucketStart 作为游标
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0)
-            {
-                int b = taskBeam[j];
-                bucketTask[bucketStart[b]++] = j;
-            }
-        // 撤销游标推进，使 bucketStart[b] 重新指向波束 b 的起点
-        for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
-        bucketStart[0] = 0;
+        // 只有任务归属发生变化后才重建 CSR 桶；纯停滞轮次直接复用。
+        if (bucketsDirty)
+        {
+            rebuild_task_buckets();
+            bucketsDirty = 0;
+        }
 
         // 邻域 1：插入一个未服务任务
         for (int j = 0; j < numTask && numBest == 0; j++)
@@ -1322,7 +1336,11 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         // 只有邻域 1-4 都没有未被禁止且达到阈值的动作时才搜索该邻域。
         if (numBest == 0 && !useOrphan)
         {
-            rebuild_insert_filter();
+            if (insertFilterDirty)
+            {
+                rebuild_insert_filter();
+                insertFilterDirty = 0;
+            }
 
             for (int i = 0; i < numTask && numBest == 0; i++)
             {
@@ -1428,6 +1446,8 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
         if (useOrphan)
         {
             apply_orphan_best();
+            bucketsDirty = 1;
+            insertFilterDirty = 1;
             if (totalProfit > bestProfit)
             {
                 save_best(beginTime);
@@ -1504,6 +1524,8 @@ void local_search(double beginTime, int *tmpIdx, double *tmpVal)
             }
             g_applyCross++;
         }
+        bucketsDirty = 1;
+        insertFilterDirty = 1;
         if (totalProfit > bestProfit)
         {
             save_best(beginTime);
@@ -1535,6 +1557,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
     const double phiMax = 100000.0;
 
     int nonImprove = 0;
+    int bucketsDirty = 1;
     int bwFeasibleStreak = 0, bwInfeasibleStreak = 0;
     int pwFeasibleStreak = 0, pwInfeasibleStreak = 0;
     double mixedStart = (double)clock();
@@ -1613,18 +1636,11 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
         int numBest = 0;
         int kind = 0, a = -1, bb = -1, cc = -1;
 
-        for (int b = 0; b <= numBeam; b++) bucketStart[b] = 0;
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0) bucketStart[taskBeam[j] + 1]++;
-        for (int b = 0; b < numBeam; b++) bucketStart[b + 1] += bucketStart[b];
-        for (int j = 0; j < numTask; j++)
-            if (taskBeam[j] >= 0)
-            {
-                int b = taskBeam[j];
-                bucketTask[bucketStart[b]++] = j;
-            }
-        for (int b = numBeam; b > 0; b--) bucketStart[b] = bucketStart[b - 1];
-        bucketStart[0] = 0;
+        if (bucketsDirty)
+        {
+            rebuild_task_buckets();
+            bucketsDirty = 0;
+        }
 
         // 邻域 1：插入一个未服务任务
         for (int j = 0; j < numTask; j++)
@@ -1883,6 +1899,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
         if (useOrphan)
         {
             apply_orphan_best();
+            bucketsDirty = 1;
             total_over_parts(curOverBW, curOverPW);
             curOver = curOverBW + curOverPW;
             if (curOver > g_mixedMaxOver) g_mixedMaxOver = curOver;
@@ -1968,6 +1985,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
             }
             g_applyCross++;
         }
+        bucketsDirty = 1;
 
         total_over_parts(curOverBW, curOverPW);
         curOver = curOverBW + curOverPW;
@@ -2013,7 +2031,6 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
 //--------------------------------------------------------------------
 void perturb(int *tmpIdx, double *tmpVal)
 {
-    restore_best();
     if (numBeam == 0) return;
 
     // 破坏：清空 30% 的波束，优先选择上次局部搜索中已服务任务移动次数
@@ -2247,7 +2264,6 @@ void ils()
         local_search(beginTime, tmpIdx, tmpVal);
         restore_best();                // 混合搜索从最好可行点开始
         local_search_mixed(beginTime, tmpIdx, tmpVal);
-        restore_best();                // 扰动和全局更新接收可行解
         numPhase++;
 
         if (numPhase == 1) probe_modes("after_LS1");
@@ -2259,6 +2275,9 @@ void ils()
                  << "  time=" << globalBestTime << " s"
                  << "  phase=" << numPhase << endl;
         }
+
+        runTime = ((double)clock() - beginTime) / CLOCKS_PER_SEC;
+        if (runTime >= maxRunTime) break;
 
         double pStart = (double)clock();
         perturb(tmpIdx, tmpVal);
