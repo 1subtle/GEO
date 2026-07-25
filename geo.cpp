@@ -2017,7 +2017,7 @@ void local_search_mixed(double beginTime, int *tmpIdx, double *tmpVal)
 //
 // 从当前阶段最好解出发：
 //
-//  破坏：选择 30% 的波束，移除其全部任务并放回未服务任务池，同时把
+//  破坏：选择 60% 的波束，移除其全部任务并放回未服务任务池，同时把
 //  模式重置为 -1，形成部分解；未选中的波束保留模式和任务分配。
 //
 //  模式修复：依次为被清空波束重新选择模式。对一个波束枚举功率可行
@@ -2033,9 +2033,9 @@ void perturb(int *tmpIdx, double *tmpVal)
 {
     if (numBeam == 0) return;
 
-    // 破坏：清空 30% 的波束，优先选择上次局部搜索中已服务任务移动次数
+    // 破坏：清空 60% 的波束，优先选择上次局部搜索中已服务任务移动次数
     // 较少的波束，推动搜索进入尚未充分探索的区域
-    int numDestroy = (int)(0.30 * numBeam + 0.5);
+    int numDestroy = (int)(0.60 * numBeam + 0.5);
     if (numDestroy < 1)        numDestroy = 1;
     if (numDestroy > numBeam)  numDestroy = numBeam;
 
@@ -2185,48 +2185,47 @@ void perturb(int *tmpIdx, double *tmpVal)
         }
     if (nFree > 0) qsort_desc(tmpVal, tmpIdx, 0, nFree - 1);
 
-    int *modeOrder = new int[numMode];
+    const double FIT_EPS = 1e-12;
     for (int k = 0; k < nFree; k++)
     {
         int j = tmpIdx[k];
 
-        int bestBeam   = -1;
-        int bestLeftBW = -1;
+        int bestBeam = -1;
+        double bestFit = 1.0e100;
+        double bestLeftPW = 1.0e100;
+        double bestLeftBW = 1.0e100;
 
-        int t = taskType[j] - 1;
-        int numCompatMode = 0;
-        for (int m = 0; m < numMode; m++)
+        for (int b = 0; b < numBeam; b++)
         {
-            if (!typeCompatMode[t][m]) continue;
+            if (!feasible_on(j, b)) continue;
 
-            int pos = numCompatMode;
-            while (pos > 0 && modeBasePower[m] < modeBasePower[modeOrder[pos - 1]])
+            int bwCap = beamBWCap[b];
+            int pwCap = beamPWCap[b] - modeBasePower[beamMode[b]];
+            if (bwCap < 1) bwCap = 1;
+            if (pwCap < 1) pwCap = 1;
+
+            double leftBW = (double)(remBW[b] - taskBWDemand[j]) / bwCap;
+            double leftPW = (double)(remPW[b] - taskPWDemand[j]) / pwCap;
+            double fit = leftBW + leftPW;
+
+            int better = (bestBeam < 0 || fit < bestFit - FIT_EPS);
+            if (!better && fit <= bestFit + FIT_EPS)
             {
-                modeOrder[pos] = modeOrder[pos - 1];
-                pos--;
+                better = leftPW < bestLeftPW - FIT_EPS ||
+                    (leftPW <= bestLeftPW + FIT_EPS &&
+                     leftBW < bestLeftBW - FIT_EPS);
             }
-            modeOrder[pos] = m;
-            numCompatMode++;
-        }
 
-        for (int km = 0; km < numCompatMode && bestBeam < 0; km++)
-        {
-            int m = modeOrder[km];
-            for (int b = 0; b < numBeam; b++)
+            if (better)
             {
-                if (beamMode[b] != m) continue;
-                if (!feasible_on(j, b)) continue;
-                int leftover = remBW[b] - taskBWDemand[j];
-                if (bestBeam < 0 || leftover < bestLeftBW)
-                {
-                    bestBeam   = b;
-                    bestLeftBW = leftover;
-                }
+                bestBeam   = b;
+                bestFit    = fit;
+                bestLeftPW = leftPW;
+                bestLeftBW = leftBW;
             }
         }
         if (bestBeam >= 0) add_task(j, bestBeam);
     }
-    delete[] modeOrder;
     delete[] perturbBeam;
     delete[] prevMode;
     delete[] beamFreqKey;
